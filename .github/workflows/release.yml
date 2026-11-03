@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  cli:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,         target: aarch64-apple-darwin,       features: "llama,metal" }
+          - { os: macos-13,         target: x86_64-apple-darwin,        features: "llama" }
+          - { os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,   features: "llama" }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu,  features: "llama" }
+          - { os: windows-2022,     target: x86_64-pc-windows-msvc,     features: "llama" }
+          - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,    features: "llama" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # Portable binaries: no -C target-cpu=native. The native engine picks
+      # SIMD kernels at runtime; llama.cpp is built with GGML_NATIVE=OFF.
+      - name: Build
+        run: cargo build --release -p langtrain --no-default-features --features "${{ matrix.features }}" --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name=langtrain-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir -p dist/$name
+          bin=target/${{ matrix.target }}/release/langtrain
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          cp "$bin" dist/$name/
+          cp -r langtune dist/$name/langtune
+          cp README.md dist/$name/
+          cd dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a -tzip $name.zip $name >/dev/null
+            sha256sum $name.zip > $name.zip.sha256
+          else
+            tar czf $name.tar.gz $name
+            shasum -a 256 $name.tar.gz > $name.tar.gz.sha256
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+
+  desktop:
+    name: Desktop app (${{ matrix.os }})
+    needs: cli
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,     target: aarch64-apple-darwin }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: windows-2022, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux webview deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Build the sidecar
+        shell: bash
+        run: |
+          features=llama; [[ "${{ matrix.target }}" == *apple* ]] && features="llama,metal"
+          cargo build --release -p langtrain --no-default-features --features "$features"
+          ext=""; [[ "${{ runner.os }}" == "Windows" ]] && ext=".exe"
+          mkdir -p studio/src-tauri/binaries
+          cp target/release/langtrain$ext studio/src-tauri/binaries/langtrain-${{ matrix.target }}$ext
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Code signing; leave unset for unsigned test builds.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        with:
+          projectPath: studio
+          tagName: ${{ github.ref_name }}
+          releaseName: Langtrain Studio ${{ github.ref_name }}

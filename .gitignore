@@ -1,0 +1,8 @@
+target/
+.cargo-home/
+*.gguf
+__pycache__/
+*.egg-info/
+.venv/
+studio/src-tauri/binaries/
+studio/src-tauri/gen/

@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Langtrain Studio",
+  "version": "0.1.0",
+  "identifier": "ai.langtrain.studio",
+  "build": {
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg", "app", "msi", "nsis", "deb", "rpm", "appimage"],
+    "icon": ["icons/icon.png"],
+    "externalBin": ["binaries/langtrain"],
+    "resources": { "../../langtune": "langtune" },
+    "category": "DeveloperTool",
+    "shortDescription": "Fast local LLM serving and CPU fine-tuning",
+    "macOS": { "minimumSystemVersion": "12.0" }
+  }
+}

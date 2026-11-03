@@ -1,0 +1,21 @@
+[package]
+name = "langtrain-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Langtrain's own pure-Rust inference engine: GGUF loader, quantized SIMD kernels, paged KV cache"
+
+[dependencies]
+langtrain-engine = { path = "../engine" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+memmap2 = "0.9"
+half = "2"
+rayon = "1"
+fancy-regex = "0.20"
+minijinja = { version = "3", features = ["loop_controls", "json"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
+
+[dev-dependencies]

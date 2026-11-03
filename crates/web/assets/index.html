@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Langtrain Studio</title>
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app">
+    <nav class="sidebar">
+      <div class="brand"><img src="/assets/icon.svg" alt=""> <span>Langtrain Studio</span></div>
+      <button class="nav active" data-view="chat">Chat</button>
+      <button class="nav" data-view="models">Models</button>
+      <button class="nav" data-view="tune">Fine-tune</button>
+      <button class="nav" data-view="system">System</button>
+      <div class="sidebar-foot" id="loaded-model">No model loaded</div>
+    </nav>
+
+    <main>
+      <!-- Chat -->
+      <section class="view active" id="view-chat">
+        <header class="toolbar">
+          <select id="chat-model" aria-label="Model"></select>
+          <label class="inline">Temperature <input id="chat-temp" type="number" min="0" max="2" step="0.1" value="0.7"></label>
+          <button class="ghost" id="chat-clear">New chat</button>
+        </header>
+        <details class="system-prompt">
+          <summary>System prompt</summary>
+          <textarea id="chat-system" rows="3" placeholder="You are a helpful assistant."></textarea>
+        </details>
+        <div class="messages" id="messages">
+          <div class="empty">Pick a model and say hello. Fine-tuned adapters show up as <code>model@adapter</code>.</div>
+        </div>
+        <form class="composer" id="composer">
+          <textarea id="prompt" rows="2" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea>
+          <button type="submit" id="send">Send</button>
+        </form>
+        <div class="stats" id="chat-stats"></div>
+      </section>
+
+      <!-- Models -->
+      <section class="view" id="view-models">
+        <header class="toolbar"><h1>Models</h1></header>
+        <p class="muted">GGUF files in <code id="models-dir"></code>. Add one with:</p>
+        <pre class="cmd">langtrain pull bartowski/Qwen2.5-1.5B-Instruct-GGUF Qwen2.5-1.5B-Instruct-Q4_K_M.gguf</pre>
+        <table class="table">
+          <thead><tr><th>Model</th><th>Size</th><th>Adapters</th><th></th></tr></thead>
+          <tbody id="models-body"></tbody>
+        </table>
+      </section>
+
+      <!-- Fine-tune -->
+      <section class="view" id="view-tune">
+        <header class="toolbar"><h1>Fine-tune</h1></header>
+        <div class="grid2">
+          <form class="card" id="tune-form">
+            <h2>New job</h2>
+            <label>Base model <select id="tune-model" required></select></label>
+            <label>Training file (JSONL path) <input id="tune-file" required placeholder="/path/to/train.jsonl"></label>
+            <label>Adapter name <input id="tune-suffix" placeholder="support-bot" pattern="[A-Za-z0-9_\-]+"></label>
+            <div class="row">
+              <label>Epochs <input id="tune-epochs" type="number" min="1" value="3"></label>
+              <label>LoRA rank <input id="tune-rank" type="number" min="1" value="16"></label>
+            </div>
+            <div class="row">
+              <label>Train top layers <input id="tune-layers" type="number" min="1" placeholder="auto"></label>
+              <label>Device
+                <select id="tune-device"><option value="">auto</option><option>cpu</option><option>mps</option><option>cuda</option></select>
+              </label>
+            </div>
+            <p class="hint" id="tune-advice"></p>
+            <button type="submit">Start training</button>
+            <p class="error" id="tune-error"></p>
+          </form>
+          <div class="card">
+            <h2>Data format</h2>
+            <p class="muted">One JSON object per line. Loss is computed on assistant replies only.</p>
+            <pre class="cmd">{"messages": [
+  {"role": "user", "content": "What is Langtrain?"},
+  {"role": "assistant", "content": "A local LLM studio."}
+]}</pre>
+            <p class="muted">Also accepted: <code>{"prompt", "completion"}</code> and <code>{"text"}</code>.</p>
+          </div>
+        </div>
+        <h2>Jobs</h2>
+        <div id="jobs"></div>
+      </section>
+
+      <!-- System -->
+      <section class="view" id="view-system">
+        <header class="toolbar"><h1>System</h1></header>
+        <div class="grid2">
+          <div class="card"><h2>Hardware</h2><dl id="hw"></dl></div>
+          <div class="card"><h2>Auto-tuned profile</h2><dl id="profile"></dl></div>
+        </div>
+        <div class="card"><h2>Engine</h2><dl id="engine"></dl></div>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
