@@ -6,7 +6,9 @@ use langtrain_native::gguf::Gguf;
 use langtrain_native::quant::{to_f32, QMatrix};
 
 fn main() -> anyhow::Result<()> {
-    let path = std::env::args().nth(1).expect("usage: dequant_check <model.gguf>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: dequant_check <model.gguf>");
     let g = Gguf::open(std::path::Path::new(&path))?;
     let mut names: Vec<&String> = g.tensors.keys().collect();
     names.sort();
@@ -28,7 +30,12 @@ fn main() -> anyhow::Result<()> {
         }
         let sum: f64 = v.iter().map(|&x| x as f64).sum();
         let abs: f64 = v.iter().map(|&x| x.abs() as f64).sum();
-        println!("{name} {:?} sum={sum:.6} abs={abs:.6} v0={:.6} vlast={:.6} repack_diff={max_diff:e}", info.dtype, v[0], v[v.len() - 1]);
+        println!(
+            "{name} {:?} sum={sum:.6} abs={abs:.6} v0={:.6} vlast={:.6} repack_diff={max_diff:e}",
+            info.dtype,
+            v[0],
+            v[v.len() - 1]
+        );
     }
     Ok(())
 }

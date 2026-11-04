@@ -39,7 +39,9 @@ fn bytes_to_unicode() -> [char; 256] {
     let mut map = ['\0'; 256];
     let mut n = 0u32;
     for b in 0..256u32 {
-        let printable = (b'!' as u32..=b'~' as u32).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
+        let printable = (b'!' as u32..=b'~' as u32).contains(&b)
+            || (0xA1..=0xAC).contains(&b)
+            || (0xAE..=0xFF).contains(&b);
         map[b as usize] = if printable {
             char::from_u32(b).unwrap()
         } else {
@@ -55,7 +57,11 @@ fn str_array(g: &Gguf, key: &str) -> Result<Vec<String>> {
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("missing {key}"))?
         .iter()
-        .map(|v| v.as_str().map(str::to_owned).ok_or_else(|| anyhow!("{key}: expected strings")))
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("{key}: expected strings"))
+        })
         .collect()
 }
 
@@ -74,9 +80,16 @@ impl Tokenizer {
         let merges = str_array(g, "tokenizer.ggml.merges")?
             .into_iter()
             .enumerate()
-            .filter_map(|(rank, m)| m.split_once(' ').map(|(a, b)| ((a.to_string(), b.to_string()), rank)))
+            .filter_map(|(rank, m)| {
+                m.split_once(' ')
+                    .map(|(a, b)| ((a.to_string(), b.to_string()), rank))
+            })
             .collect();
-        let vocab: HashMap<String, i32> = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as i32)).collect();
+        let vocab: HashMap<String, i32> = tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), i as i32))
+            .collect();
 
         let mut special_ids = vec![false; tokens.len()];
         let mut specials: Vec<(String, i32)> = Vec::new();
@@ -96,7 +109,9 @@ impl Tokenizer {
             "llama3" | "llama-bpe" | "falcon3" | "pixtral" => vec![LLAMA3_RE],
             "qwen2" | "deepseek-r1-qwen" => vec![QWEN2_RE],
             // Digits are split one by one before the GPT-2 pattern.
-            "smollm" | "starcoder" | "refact" | "command-r" | "codeshell" => vec![r"\p{N}", GPT2_RE],
+            "smollm" | "starcoder" | "refact" | "command-r" | "codeshell" => {
+                vec![r"\p{N}", GPT2_RE]
+            }
             _ => vec![GPT2_RE],
         }
         .into_iter()
@@ -106,9 +121,24 @@ impl Tokenizer {
         let id = |k: &str| g.get(k).and_then(Value::as_u64).map(|v| v as i32);
         let bos = id("tokenizer.ggml.bos_token_id");
         let eos = id("tokenizer.ggml.eos_token_id");
-        let mut eog: Vec<i32> = [eos, id("tokenizer.ggml.eot_token_id"), id("tokenizer.ggml.eom_token_id")].into_iter().flatten().collect();
+        let mut eog: Vec<i32> = [
+            eos,
+            id("tokenizer.ggml.eot_token_id"),
+            id("tokenizer.ggml.eom_token_id"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         // Chat end markers that some GGUFs do not list as EOS.
-        for name in ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<|endoftext|>", "<end_of_turn>", "<|end|>", "<|eom_id|>"] {
+        for name in [
+            "<|im_end|>",
+            "<|eot_id|>",
+            "<|end_of_text|>",
+            "<|endoftext|>",
+            "<end_of_turn>",
+            "<|end|>",
+            "<|eom_id|>",
+        ] {
             if let Some(&i) = vocab.get(name) {
                 eog.push(i);
             }
@@ -117,13 +147,24 @@ impl Tokenizer {
         eog.dedup();
 
         let byte_enc = bytes_to_unicode();
-        let text_of = |i: Option<i32>| i.and_then(|i| tokens.get(i as usize)).cloned().unwrap_or_default();
+        let text_of = |i: Option<i32>| {
+            i.and_then(|i| tokens.get(i as usize))
+                .cloned()
+                .unwrap_or_default()
+        };
         Ok(Self {
             bos_text: text_of(bos),
             eos_text: text_of(eos),
-            byte_dec: byte_enc.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect(),
+            byte_dec: byte_enc
+                .iter()
+                .enumerate()
+                .map(|(b, &c)| (c, b as u8))
+                .collect(),
             byte_enc,
-            add_bos: g.get("tokenizer.ggml.add_bos_token").and_then(Value::as_bool).unwrap_or(false),
+            add_bos: g
+                .get("tokenizer.ggml.add_bos_token")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             template: g.str("tokenizer.chat_template").map(str::to_owned),
             tokens,
             vocab,
@@ -210,7 +251,11 @@ impl Tokenizer {
                 let best = syms
                     .windows(2)
                     .enumerate()
-                    .filter_map(|(i, w)| self.merges.get(&(w[0].clone(), w[1].clone())).map(|&r| (r, i)))
+                    .filter_map(|(i, w)| {
+                        self.merges
+                            .get(&(w[0].clone(), w[1].clone()))
+                            .map(|&r| (r, i))
+                    })
                     .min();
                 let Some((_, i)) = best else { break };
                 let merged = format!("{}{}", syms[i], syms[i + 1]);
@@ -221,7 +266,10 @@ impl Tokenizer {
                 match self.vocab.get(&s) {
                     Some(&id) => out.push(id),
                     // Unknown symbol: fall back to single-byte tokens.
-                    None => out.extend(s.chars().filter_map(|c| self.vocab.get(&c.to_string()).copied())),
+                    None => out.extend(
+                        s.chars()
+                            .filter_map(|c| self.vocab.get(&c.to_string()).copied()),
+                    ),
                 }
             }
         }
@@ -237,23 +285,38 @@ impl Tokenizer {
         if self.specials.iter().any(|(sp, id)| *id == t && sp == s) {
             return s.as_bytes().to_vec(); // user-defined tokens are literal text
         }
-        s.chars().map(|c| self.byte_dec.get(&c).copied().unwrap_or(b'?')).collect()
+        s.chars()
+            .map(|c| self.byte_dec.get(&c).copied().unwrap_or(b'?'))
+            .collect()
     }
 
     pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String> {
         let Some(tmpl) = &self.template else {
-            let mut s: String = messages.iter().map(|m| format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content)).collect();
+            let mut s: String = messages
+                .iter()
+                .map(|m| format!("<|im_start|>{}\n{}<|im_end|>\n", m.role, m.content))
+                .collect();
             s.push_str("<|im_start|>assistant\n");
             return Ok(s);
         };
         let mut env = minijinja::Environment::new();
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
-            Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
-        });
-        env.add_template("chat", tmpl).map_err(|e| anyhow!("chat template: {e}"))?;
-        let msgs: Vec<_> = messages.iter().map(|m| minijinja::context! { role => &m.role, content => &m.content }).collect();
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> Result<String, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
+            },
+        );
+        env.add_template("chat", tmpl)
+            .map_err(|e| anyhow!("chat template: {e}"))?;
+        let msgs: Vec<_> = messages
+            .iter()
+            .map(|m| minijinja::context! { role => &m.role, content => &m.content })
+            .collect();
         env.get_template("chat")?
             .render(minijinja::context! {
                 messages => msgs,

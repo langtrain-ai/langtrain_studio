@@ -15,6 +15,7 @@
 pub mod gguf;
 pub mod kv;
 pub mod model;
+pub mod pool;
 pub mod quant;
 pub mod tokenizer;
 
@@ -77,7 +78,12 @@ impl NativeBackend {
         static POOL: Once = Once::new();
         let threads = opts.threads.max(1);
         POOL.call_once(|| {
-            let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).thread_name(|i| format!("lt-native-{i}")).build_global();
+            // rayon for model loading; the spin pool for the per-token hot path.
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("lt-load-{i}"))
+                .build_global();
+            pool::init(threads);
         });
 
         let t0 = std::time::Instant::now();
@@ -85,7 +91,11 @@ impl NativeBackend {
         let model = Model::load(&g)?;
         let tok = Tokenizer::from_gguf(&g)?;
         let c = &model.cfg;
-        let kv = KvCache::new(c.n_layers, c.n_kv_heads * c.head_dim, opts.kv_tokens as usize);
+        let kv = KvCache::new(
+            c.n_layers,
+            c.n_kv_heads * c.head_dim,
+            opts.kv_tokens as usize,
+        );
 
         let mut adapters = BTreeMap::new();
         for (name, path) in &opts.adapters {
@@ -105,7 +115,12 @@ impl NativeBackend {
             "native engine loaded"
         );
         Ok(Self {
-            name: opts.model_path.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string(),
+            name: opts
+                .model_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("model")
+                .to_string(),
             model,
             tok,
             kv,
@@ -149,9 +164,16 @@ impl Backend for NativeBackend {
         let tokens: Vec<i32> = batch.iter().map(|b| b.token).collect();
         let seqs: Vec<u32> = batch.iter().map(|b| b.seq).collect();
         let pos: Vec<usize> = batch.iter().map(|b| b.pos as usize).collect();
-        let want: Vec<usize> = batch.iter().enumerate().filter(|(_, b)| b.logits).map(|(i, _)| i).collect();
+        let want: Vec<usize> = batch
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.logits)
+            .map(|(i, _)| i)
+            .collect();
         let lora = self.active.as_ref().and_then(|a| self.adapters.get(a));
-        self.logits = self.model.forward(&mut self.kv, &tokens, &seqs, &pos, &want, lora)?;
+        self.logits = self
+            .model
+            .forward(&mut self.kv, &tokens, &seqs, &pos, &want, lora)?;
         self.logit_row = vec![None; batch.len()];
         for (row, &i) in want.iter().enumerate() {
             self.logit_row[i] = Some(row);

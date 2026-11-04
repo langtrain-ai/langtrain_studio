@@ -65,7 +65,10 @@ impl KvCache {
     }
 
     fn alloc(&mut self) -> Result<usize> {
-        let b = self.free.pop().ok_or_else(|| anyhow::anyhow!("KV cache full"))?;
+        let b = self
+            .free
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("KV cache full"))?;
         self.refs[b] = 1;
         Ok(b)
     }
@@ -82,7 +85,10 @@ impl KvCache {
     pub fn append(&mut self, seq: u32, pos: usize) -> Result<(usize, usize)> {
         let s = self.seqs.entry(seq).or_default().clone();
         if pos != s.len {
-            bail!("seq {seq}: position {pos} is not contiguous (length {})", s.len);
+            bail!(
+                "seq {seq}: position {pos} is not contiguous (length {})",
+                s.len
+            );
         }
         let slot = pos % BLOCK;
         let mut blocks = s.blocks;
@@ -104,7 +110,13 @@ impl KvCache {
             }
         }
         let block = *blocks.last().unwrap();
-        self.seqs.insert(seq, Seq { blocks, len: pos + 1 });
+        self.seqs.insert(
+            seq,
+            Seq {
+                blocks,
+                len: pos + 1,
+            },
+        );
         Ok((block, slot))
     }
 
@@ -120,8 +132,17 @@ impl KvCache {
 
     /// Visit K and V rows for positions `0..n` of `seq` in `layer`.
     #[inline]
-    pub fn rows(&self, layer: usize, seq: u32, n: usize) -> impl Iterator<Item = (&[f16], &[f16])> + '_ {
-        let blocks: &[usize] = self.seqs.get(&seq).map(|s| s.blocks.as_slice()).unwrap_or(&[]);
+    pub fn rows(
+        &self,
+        layer: usize,
+        seq: u32,
+        n: usize,
+    ) -> impl Iterator<Item = (&[f16], &[f16])> + '_ {
+        let blocks: &[usize] = self
+            .seqs
+            .get(&seq)
+            .map(|s| s.blocks.as_slice())
+            .unwrap_or(&[]);
         (0..n).map(move |p| {
             let o = self.offset(layer, blocks[p / BLOCK], p % BLOCK);
             (&self.k[o..o + self.kv_dim], &self.v[o..o + self.kv_dim])
@@ -130,7 +151,9 @@ impl KvCache {
 
     /// Drop positions `from..` of `seq`.
     pub fn truncate(&mut self, seq: u32, from: usize) {
-        let Some(mut s) = self.seqs.remove(&seq) else { return };
+        let Some(mut s) = self.seqs.remove(&seq) else {
+            return;
+        };
         if from >= s.len {
             self.seqs.insert(seq, s);
             return;

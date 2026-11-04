@@ -4,11 +4,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
+use half::slice::HalfFloatSliceExt;
 use rayon::prelude::*;
 
 use crate::gguf::{Gguf, Value};
 use crate::kv::KvCache;
-use crate::quant::{to_f32, QActs, QMatrix};
+use crate::quant::{matmul_many, to_f32, QActs, QMatrix};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -40,7 +41,15 @@ pub enum Proj {
 }
 
 impl Proj {
-    pub const ALL: [Proj; 7] = [Proj::Q, Proj::K, Proj::V, Proj::O, Proj::Gate, Proj::Up, Proj::Down];
+    pub const ALL: [Proj; 7] = [
+        Proj::Q,
+        Proj::K,
+        Proj::V,
+        Proj::O,
+        Proj::Gate,
+        Proj::Up,
+        Proj::Down,
+    ];
     pub fn gguf_name(self) -> &'static str {
         match self {
             Proj::Q => "attn_q",
@@ -81,7 +90,10 @@ impl Lora {
         for l in 0..cfg.n_layers {
             for p in Proj::ALL {
                 let base = format!("blk.{l}.{}.weight", p.gguf_name());
-                let (Some((ai, ad)), Some((bi, bd))) = (g.tensor(&format!("{base}.lora_a")), g.tensor(&format!("{base}.lora_b"))) else {
+                let (Some((ai, ad)), Some((bi, bd))) = (
+                    g.tensor(&format!("{base}.lora_a")),
+                    g.tensor(&format!("{base}.lora_b")),
+                ) else {
                     continue;
                 };
                 let rank = ai.dims[1];
@@ -89,7 +101,15 @@ impl Lora {
                     bail!("{base}: lora_a/lora_b rank mismatch");
                 }
                 let scale = alpha.map(|a| a as f32 / rank as f32).unwrap_or(1.0);
-                pairs.insert((l, p), LoraPair { a: to_f32(ai, ad)?, b: to_f32(bi, bd)?, rank, scale });
+                pairs.insert(
+                    (l, p),
+                    LoraPair {
+                        a: to_f32(ai, ad)?,
+                        b: to_f32(bi, bd)?,
+                        rank,
+                        scale,
+                    },
+                );
             }
         }
         if pairs.is_empty() {
@@ -100,11 +120,24 @@ impl Lora {
 
     /// `y[t] += scale * B (A x[t])` for `n` rows.
     #[allow(clippy::too_many_arguments)]
-    fn apply(&self, layer: usize, p: Proj, x: &[f32], n: usize, in_dim: usize, y: &mut [f32], out_dim: usize) {
-        let Some(lp) = self.pairs.get(&(layer, p)) else { return };
+    fn apply(
+        &self,
+        layer: usize,
+        p: Proj,
+        x: &[f32],
+        n: usize,
+        in_dim: usize,
+        y: &mut [f32],
+        out_dim: usize,
+    ) {
+        let Some(lp) = self.pairs.get(&(layer, p)) else {
+            return;
+        };
         for t in 0..n {
             let xt = &x[t * in_dim..(t + 1) * in_dim];
-            let mid: Vec<f32> = (0..lp.rank).map(|r| dot(&lp.a[r * in_dim..(r + 1) * in_dim], xt)).collect();
+            let mid: Vec<f32> = (0..lp.rank)
+                .map(|r| dot(&lp.a[r * in_dim..(r + 1) * in_dim], xt))
+                .collect();
             let yt = &mut y[t * out_dim..(t + 1) * out_dim];
             for (o, yo) in yt.iter_mut().enumerate() {
                 *yo += lp.scale * dot(&lp.b[o * lp.rank..(o + 1) * lp.rank], &mid);
@@ -122,9 +155,20 @@ pub struct Model {
     inv_freq: Vec<f32>,
 }
 
+/// f32 dot product with 8 independent partial sums, so the compiler can
+/// keep it in vector registers (a single running sum cannot be reordered).
 #[inline]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+    let mut acc = [0f32; 8];
+    let (ca, cb) = (a.chunks_exact(8), b.chunks_exact(8));
+    let (ra, rb) = (ca.remainder(), cb.remainder());
+    for (x, y) in ca.zip(cb) {
+        for k in 0..8 {
+            acc[k] += x[k] * y[k];
+        }
+    }
+    let tail: f32 = ra.iter().zip(rb).map(|(x, y)| x * y).sum();
+    acc.iter().sum::<f32>() + tail
 }
 
 fn rms_norm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
@@ -149,9 +193,19 @@ impl Model {
         let k = |s: &str| format!("{arch}.{s}");
         let dim = g.u64(&k("embedding_length"))? as usize;
         let n_heads = g.u64(&k("attention.head_count"))? as usize;
-        let n_kv_heads = g.get(&k("attention.head_count_kv")).and_then(Value::as_u64).unwrap_or(n_heads as u64) as usize;
-        let head_dim = g.get(&k("attention.key_length")).and_then(Value::as_u64).map(|v| v as usize).unwrap_or(dim / n_heads);
-        let t = |name: &str| g.tensor(name).ok_or_else(|| anyhow!("missing tensor {name}"));
+        let n_kv_heads = g
+            .get(&k("attention.head_count_kv"))
+            .and_then(Value::as_u64)
+            .unwrap_or(n_heads as u64) as usize;
+        let head_dim = g
+            .get(&k("attention.key_length"))
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(dim / n_heads);
+        let t = |name: &str| {
+            g.tensor(name)
+                .ok_or_else(|| anyhow!("missing tensor {name}"))
+        };
         let (embed_info, _) = t("token_embd.weight")?;
         let cfg = Config {
             dim,
@@ -163,9 +217,16 @@ impl Model {
             vocab: embed_info.dims[1],
             eps: g.f64_or(&k("attention.layer_norm_rms_epsilon"), 1e-5) as f32,
             rope_base: g.f64_or(&k("rope.freq_base"), 10_000.0) as f32,
-            rope_dim: g.get(&k("rope.dimension_count")).and_then(Value::as_u64).map(|v| v as usize).unwrap_or(head_dim),
+            rope_dim: g
+                .get(&k("rope.dimension_count"))
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+                .unwrap_or(head_dim),
             rope_neox,
-            ctx_train: g.get(&k("context_length")).and_then(Value::as_u64).unwrap_or(4096) as usize,
+            ctx_train: g
+                .get(&k("context_length"))
+                .and_then(Value::as_u64)
+                .unwrap_or(4096) as usize,
             arch,
         };
 
@@ -199,12 +260,17 @@ impl Model {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let inv_freq = (0..cfg.rope_dim / 2).map(|i| cfg.rope_base.powf(-2.0 * i as f32 / cfg.rope_dim as f32)).collect();
+        let inv_freq = (0..cfg.rope_dim / 2)
+            .map(|i| cfg.rope_base.powf(-2.0 * i as f32 / cfg.rope_dim as f32))
+            .collect();
         Ok(Self {
             embed: mat("token_embd.weight")?,
             output_norm: vecf("output_norm.weight")?,
             // Tied embeddings when there is no separate output matrix.
-            output: g.tensor("output.weight").map(|(i, d)| QMatrix::from_gguf(i, d)).transpose()?,
+            output: g
+                .tensor("output.weight")
+                .map(|(i, d)| QMatrix::from_gguf(i, d))
+                .transpose()?,
             layers,
             inv_freq,
             cfg,
@@ -214,7 +280,12 @@ impl Model {
     pub fn weight_bytes(&self) -> usize {
         self.embed.bytes()
             + self.output.as_ref().map(QMatrix::bytes).unwrap_or(0)
-            + self.layers.iter().flat_map(|l| l.w.values()).map(QMatrix::bytes).sum::<usize>()
+            + self
+                .layers
+                .iter()
+                .flat_map(|l| l.w.values())
+                .map(QMatrix::bytes)
+                .sum::<usize>()
     }
 
     fn rope(&self, x: &mut [f32], n_heads: usize, pos: usize) {
@@ -224,7 +295,11 @@ impl Model {
             let v = &mut x[h * hd..(h + 1) * hd];
             for (i, f) in self.inv_freq.iter().enumerate() {
                 let (sin, cos) = (pos as f32 * f).sin_cos();
-                let (a, b) = if self.cfg.rope_neox { (i, i + half) } else { (2 * i, 2 * i + 1) };
+                let (a, b) = if self.cfg.rope_neox {
+                    (i, i + half)
+                } else {
+                    (2 * i, 2 * i + 1)
+                };
                 let (x0, x1) = (v[a], v[b]);
                 v[a] = x0 * cos - x1 * sin;
                 v[b] = x0 * sin + x1 * cos;
@@ -232,27 +307,46 @@ impl Model {
         }
     }
 
-    fn proj(&self, layer: usize, p: Proj, x: &[f32], xq: &QActs, out: &mut [f32], lora: Option<&Lora>) {
+    fn proj(
+        &self,
+        layer: usize,
+        p: Proj,
+        x: &[f32],
+        xq: &QActs,
+        out: &mut [f32],
+        lora: Option<&Lora>,
+    ) {
         self.layers[layer].w[&p].matmul(xq, out);
         self.finish_proj(layer, p, x, xq, out, lora);
     }
 
-    /// Several projections of the same input in one parallel region, so
-    /// threads that finish one matrix move on to the next without a barrier.
-    fn proj_many(&self, layer: usize, x: &[f32], xq: &QActs, outs: &mut [(Proj, &mut [f32])], lora: Option<&Lora>) {
+    /// Projections that share an input, dispatched together.
+    fn proj_many(
+        &self,
+        layer: usize,
+        x: &[f32],
+        xq: &QActs,
+        outs: &mut [(Proj, &mut [f32])],
+        lora: Option<&Lora>,
+    ) {
         let w = &self.layers[layer].w;
-        rayon::scope(|s| {
-            for (p, out) in outs.iter_mut() {
-                let m = &w[p];
-                s.spawn(move |_| m.matmul(xq, out));
-            }
-        });
+        let mut jobs: Vec<(&QMatrix, &mut [f32])> =
+            outs.iter_mut().map(|(p, o)| (&w[p], &mut **o)).collect();
+        matmul_many(xq, &mut jobs);
         for (p, out) in outs.iter_mut() {
             self.finish_proj(layer, *p, x, xq, out, lora);
         }
     }
 
-    fn finish_proj(&self, layer: usize, p: Proj, x: &[f32], xq: &QActs, out: &mut [f32], lora: Option<&Lora>) {
+    fn finish_proj(
+        &self,
+        layer: usize,
+        p: Proj,
+        x: &[f32],
+        xq: &QActs,
+        out: &mut [f32],
+        lora: Option<&Lora>,
+    ) {
         let l = &self.layers[layer];
         let w = &l.w[&p];
         if let Some(b) = l.bias.get(&p) {
@@ -284,7 +378,9 @@ impl Model {
         let (q_dim, kv_dim) = (c.n_heads * hd, c.n_kv_heads * hd);
 
         // Claim KV cells first so copy-on-write happens before any layer writes.
-        let cells = (0..n).map(|i| kv.append(seqs[i], positions[i])).collect::<Result<Vec<_>>>()?;
+        let cells = (0..n)
+            .map(|i| kv.append(seqs[i], positions[i]))
+            .collect::<Result<Vec<_>>>()?;
 
         let mut x = vec![0f32; n * dim];
         let mut emb_row = vec![0f32; dim];
@@ -308,41 +404,74 @@ impl Model {
         for (li, layer) in self.layers.iter().enumerate() {
             rms_norm(&x, &layer.attn_norm, c.eps, &mut h);
             xq.quantize(&h, n, dim);
-            self.proj_many(li, &h, &xq, &mut [(Proj::Q, &mut q), (Proj::K, &mut k), (Proj::V, &mut v)], lora);
+            self.proj_many(
+                li,
+                &h,
+                &xq,
+                &mut [(Proj::Q, &mut q), (Proj::K, &mut k), (Proj::V, &mut v)],
+                lora,
+            );
             for i in 0..n {
                 self.rope(&mut q[i * q_dim..(i + 1) * q_dim], c.n_heads, positions[i]);
-                self.rope(&mut k[i * kv_dim..(i + 1) * kv_dim], c.n_kv_heads, positions[i]);
+                self.rope(
+                    &mut k[i * kv_dim..(i + 1) * kv_dim],
+                    c.n_kv_heads,
+                    positions[i],
+                );
                 let (b, s) = cells[i];
-                kv.write(li, b, s, &k[i * kv_dim..(i + 1) * kv_dim], &v[i * kv_dim..(i + 1) * kv_dim]);
+                kv.write(
+                    li,
+                    b,
+                    s,
+                    &k[i * kv_dim..(i + 1) * kv_dim],
+                    &v[i * kv_dim..(i + 1) * kv_dim],
+                );
             }
 
-            // Causal attention over each token's own sequence, one task per (token, head).
+            // Causal attention over each token's own sequence. One task per
+            // (token, KV head): each cached K/V row is widened from f16 once
+            // and reused by every query head that shares it (GQA).
             let kv_ref = &*kv;
-            att.par_chunks_mut(hd).enumerate().for_each(|(idx, out)| {
-                let (i, head) = (idx / c.n_heads, idx % c.n_heads);
-                let kvh = head / group;
-                let qv = &q[i * q_dim + head * hd..i * q_dim + (head + 1) * hd];
+            crate::pool::for_chunks(&mut att, group * hd, |idx, out| {
+                let (i, kvh) = (idx / c.n_kv_heads, idx % c.n_kv_heads);
+                let qs = &q[i * q_dim + kvh * group * hd..i * q_dim + (kvh + 1) * group * hd];
                 let len = positions[i] + 1;
-                let mut scores: Vec<f32> = kv_ref
-                    .rows(li, seqs[i], len)
-                    .map(|(kr, _)| {
-                        let kr = &kr[kvh * hd..(kvh + 1) * hd];
-                        qv.iter().zip(kr).map(|(a, b)| a * b.to_f32()).sum::<f32>() * scale
-                    })
-                    .collect();
-                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0;
-                for s in scores.iter_mut() {
-                    *s = (*s - max).exp();
-                    sum += *s;
+                thread_local! {
+                    static BUF: std::cell::RefCell<(Vec<f32>, Vec<f32>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
                 }
-                out.fill(0.0);
-                for ((_, vr), s) in kv_ref.rows(li, seqs[i], len).zip(&scores) {
-                    let w = s / sum;
-                    for (o, vv) in out.iter_mut().zip(&vr[kvh * hd..(kvh + 1) * hd]) {
-                        *o += w * vv.to_f32();
+                BUF.with_borrow_mut(|(scores, row)| {
+                    // scores[g * len + p] for query head g at position p.
+                    scores.clear();
+                    scores.resize(group * len, 0.0);
+                    row.resize(hd, 0.0);
+                    for (p, (kr, _)) in kv_ref.rows(li, seqs[i], len).enumerate() {
+                        kr[kvh * hd..(kvh + 1) * hd].convert_to_f32_slice(row);
+                        for g in 0..group {
+                            scores[g * len + p] = dot(&qs[g * hd..(g + 1) * hd], row) * scale;
+                        }
                     }
-                }
+                    for g in 0..group {
+                        let sg = &mut scores[g * len..(g + 1) * len];
+                        let max = sg.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let mut sum = 0.0;
+                        for v in sg.iter_mut() {
+                            *v = (*v - max).exp();
+                            sum += *v;
+                        }
+                        let inv = 1.0 / sum;
+                        sg.iter_mut().for_each(|v| *v *= inv);
+                    }
+                    out.fill(0.0);
+                    for (p, (_, vr)) in kv_ref.rows(li, seqs[i], len).enumerate() {
+                        vr[kvh * hd..(kvh + 1) * hd].convert_to_f32_slice(row);
+                        for g in 0..group {
+                            let w = scores[g * len + p];
+                            for (o, v) in out[g * hd..(g + 1) * hd].iter_mut().zip(row.iter()) {
+                                *o += w * v;
+                            }
+                        }
+                    }
+                });
             });
 
             xq.quantize(&att, n, q_dim);
@@ -353,7 +482,13 @@ impl Model {
 
             rms_norm(&x, &layer.ffn_norm, c.eps, &mut h);
             xq.quantize(&h, n, dim);
-            self.proj_many(li, &h, &xq, &mut [(Proj::Gate, &mut gate), (Proj::Up, &mut up)], lora);
+            self.proj_many(
+                li,
+                &h,
+                &xq,
+                &mut [(Proj::Gate, &mut gate), (Proj::Up, &mut up)],
+                lora,
+            );
             for (g, u) in gate.iter_mut().zip(&up) {
                 *g = *g / (1.0 + (-*g).exp()) * u; // SiLU(g) * u
             }

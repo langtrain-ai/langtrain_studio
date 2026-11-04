@@ -132,7 +132,11 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= self.buf.len()).ok_or_else(|| anyhow!("truncated GGUF"))?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&e| e <= self.buf.len())
+            .ok_or_else(|| anyhow!("truncated GGUF"))?;
         let s = &self.buf[self.pos..end];
         self.pos = end;
         Ok(s)
@@ -202,15 +206,32 @@ impl Gguf {
         for _ in 0..n_tensors {
             let name = r.string()?;
             let n_dims = r.u32()? as usize;
-            let dims = (0..n_dims).map(|_| r.u64().map(|d| d as usize)).collect::<Result<Vec<_>>>()?;
+            let dims = (0..n_dims)
+                .map(|_| r.u64().map(|d| d as usize))
+                .collect::<Result<Vec<_>>>()?;
             let dtype = DType::from_u32(r.u32()?);
             let offset = r.u64()? as usize;
-            tensors.insert(name, TensorInfo { dims, dtype, offset });
+            tensors.insert(
+                name,
+                TensorInfo {
+                    dims,
+                    dtype,
+                    offset,
+                },
+            );
         }
 
-        let align = metadata.get("general.alignment").and_then(Value::as_u64).unwrap_or(32) as usize;
+        let align = metadata
+            .get("general.alignment")
+            .and_then(Value::as_u64)
+            .unwrap_or(32) as usize;
         let data_start = r.pos.div_ceil(align) * align;
-        let g = Self { mmap, metadata, tensors, data_start };
+        let g = Self {
+            mmap,
+            metadata,
+            tensors,
+            data_start,
+        };
         for (name, t) in &g.tensors {
             if let Some(n) = t.dtype.size_of(t.n_elements()) {
                 if g.data_start + t.offset + n > g.mmap.len() {
@@ -226,7 +247,9 @@ impl Gguf {
     }
 
     pub fn u64(&self, key: &str) -> Result<u64> {
-        self.get(key).and_then(Value::as_u64).ok_or_else(|| anyhow!("missing metadata {key}"))
+        self.get(key)
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow!("missing metadata {key}"))
     }
 
     pub fn f64_or(&self, key: &str, default: f64) -> f64 {
@@ -238,7 +261,8 @@ impl Gguf {
     }
 
     pub fn architecture(&self) -> Result<&str> {
-        self.str("general.architecture").ok_or_else(|| anyhow!("missing general.architecture"))
+        self.str("general.architecture")
+            .ok_or_else(|| anyhow!("missing general.architecture"))
     }
 
     pub fn tensor(&self, name: &str) -> Option<(&TensorInfo, &[u8])> {

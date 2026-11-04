@@ -55,24 +55,33 @@ Concurrency and context are tuned to the machine's RAM; override them with `--pa
 
 ## Measured so far
 
-Apple M2 (4 performance + 4 efficiency cores, 16 GB), CPU only, SmolLM2-135M-Instruct, 4 threads (the auto-tuned default):
+Apple M2 (4 performance + 4 efficiency cores, 16 GB), CPU only, SmolLM2-135M-Instruct, 4 threads (the auto-tuned default). Throughput from `langtrain bench` (about 300 tokens of shared system prompt, 64 new tokens per request):
 
 | | Native engine | llama.cpp |
 |---|---|---|
 | Greedy output vs llama.cpp, Q8_0 | Identical over 120 tokens (code, quotes, emoji) | reference |
 | Greedy output vs llama.cpp, Q4_K_M | Coherent; diverges after a few tokens (activation block size differs at near-tied logits) | reference |
 | Dequantization vs gguf-py reference, Q4_K_M | All 211 tensors match (Q4_K, Q6_K, Q5_0, Q8_0) | |
-| Q4_K_M, 1 stream | ~132 tok/s per stream | ~320 tok/s |
-| Q4_K_M, 4 concurrent streams | ~188 tok/s total | ~409 tok/s total |
-| Prefix cache on a shared system prompt | 93–96% of prompt tokens reused | same scheduler |
+| Q4_K_M, 1 stream | ~249 tok/s | ~319 tok/s |
+| Q4_K_M, 4 and 8 concurrent streams | ~370–415 tok/s total | ~375–410 tok/s total |
+| Q8_0, 1 stream | ~267 tok/s | ~305 tok/s |
+| Q8_0, 4 concurrent streams | ~470 tok/s total | ~675 tok/s total |
+| Prefix cache on a shared system prompt | 93–97% of prompt tokens reused | same scheduler |
+
+Single-stream and batched results from the native engine are bit-identical for a given request: one kernel serves both paths, so an answer never depends on how many other requests are running.
 
 LangTune: 30 examples, 8 epochs, top 10/30 layers took 43 s end to end on the CPU (loss 2.29 → 0.004), and the adapter answered correctly on both engines.
 
-Threads matter: on hybrid CPUs, using the efficiency cores too made both engines slower, so the profile uses performance cores only. The native engine is currently about 2x slower than llama.cpp; the gap is in the matmul and attention loops, not in batching or caching.
+What got the native engine here:
+
+- **A spin-then-park thread pool** for the per-token hot path. A small model's token runs about 200 short matmuls, and waking parked threads for each cost as much as the work.
+- **One kernel per weight format and token count** (NEON `sdot`), unrolled so accumulators stay in registers. A 4096x4096 Q8_0 matmul reaches about 110 GB/s, the M2's memory bandwidth; batches unpack each weight block once for up to 4 tokens.
+- **Grouped attention**: each cached K/V row is widened from f16 once and shared by the query heads that use it.
+- **Performance cores only** on hybrid CPUs; adding the efficiency cores made both engines slower.
 
 ## Native engine roadmap
 
-- Close the speed gap with llama.cpp: tiled multi-row matmul (i8mm `smmla`), a lighter attention loop, int8 KV cache
+- Close the remaining gap on Q8_0 batches and single streams: i8mm `smmla` tiles for batches, fused attention, int8 KV cache
 - AVX-512/AMX and SVE kernels
 - SentencePiece tokenizers (Llama 2, Mistral v0.1) and more architectures (Gemma, Phi, Qwen3)
 - Speculative decoding, constrained JSON output, KV cache saved to disk

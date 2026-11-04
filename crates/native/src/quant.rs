@@ -13,7 +13,6 @@
 
 use anyhow::{bail, Result};
 use half::f16;
-use rayon::prelude::*;
 
 use crate::gguf::{DType, TensorInfo};
 
@@ -30,7 +29,11 @@ pub enum Weights {
     Q4M { qs: Vec<u8>, mins: Vec<f32> },
     /// Unsigned 5-bit with a per-block minimum (from Q5_K): 4-bit nibbles
     /// plus one high-bit plane (4 bytes per 32 values).
-    Q5M { qs: Vec<u8>, qh: Vec<u8>, mins: Vec<f32> },
+    Q5M {
+        qs: Vec<u8>,
+        qh: Vec<u8>,
+        mins: Vec<f32>,
+    },
     /// Signed 6-bit stored as int8, one scale per 16 values (from Q6_K).
     Q6 { qs: Vec<i8> },
 }
@@ -56,7 +59,10 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {
-        ((q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
+        (
+            (q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
     }
 }
 
@@ -128,9 +134,19 @@ fn decode_legacy(dtype: DType, b: &[u8], q: &mut [u8; QK]) -> (f32, f32) {
         DType::Q4_1 => (f16_at(b, 0), -f16_at(b, 2), None, &b[4..20]),
         DType::Q5_0 => {
             let d = f16_at(b, 0);
-            (d, 16.0 * d, Some(u32::from_le_bytes(b[2..6].try_into().unwrap())), &b[6..22])
+            (
+                d,
+                16.0 * d,
+                Some(u32::from_le_bytes(b[2..6].try_into().unwrap())),
+                &b[6..22],
+            )
         }
-        DType::Q5_1 => (f16_at(b, 0), -f16_at(b, 2), Some(u32::from_le_bytes(b[4..8].try_into().unwrap())), &b[8..24]),
+        DType::Q5_1 => (
+            f16_at(b, 0),
+            -f16_at(b, 2),
+            Some(u32::from_le_bytes(b[4..8].try_into().unwrap())),
+            &b[8..24],
+        ),
         _ => unreachable!("not a legacy min type"),
     };
     for j in 0..16 {
@@ -196,10 +212,18 @@ pub fn to_f32(info: &TensorInfo, data: &[u8]) -> Result<Vec<f32>> {
             }
         }
         DType::Q4K | DType::Q5K => {
-            let (size, q5) = if info.dtype == DType::Q4K { (144, false) } else { (176, true) };
+            let (size, q5) = if info.dtype == DType::Q4K {
+                (144, false)
+            } else {
+                (176, true)
+            };
             let (mut q, mut sc, mut mn) = ([0u8; QK_K], [0f32; 8], [0f32; 8]);
             for (b, blk) in data.chunks_exact(size).enumerate() {
-                if q5 { decode_q5k(blk, &mut q, &mut sc, &mut mn) } else { decode_q4k(blk, &mut q, &mut sc, &mut mn) }
+                if q5 {
+                    decode_q5k(blk, &mut q, &mut sc, &mut mn)
+                } else {
+                    decode_q4k(blk, &mut q, &mut sc, &mut mn)
+                }
                 for i in 0..QK_K {
                     out[b * QK_K + i] = sc[i / 32] * q[i] as f32 - mn[i / 32];
                 }
@@ -324,7 +348,12 @@ impl QMatrix {
         for (b, chunk) in v.chunks_exact(QK).enumerate() {
             scales.push(quantize_block(chunk, &mut qs[b * QK..(b + 1) * QK]));
         }
-        QMatrix { rows, cols, scales, w: Weights::Q8 { qs } }
+        QMatrix {
+            rows,
+            cols,
+            scales,
+            w: Weights::Q8 { qs },
+        }
     }
 
     pub fn bytes(&self) -> usize {
@@ -374,6 +403,15 @@ impl QMatrix {
     /// Dot product of row `r` with activation row `t`.
     #[inline]
     fn row_dot(&self, r: usize, x: &QActs, t: usize) -> f32 {
+        // One kernel for single-token and batched rows, so a request's output
+        // never depends on how many other requests share the batch.
+        #[cfg(target_arch = "aarch64")]
+        if dotprod() {
+            let mut v = [0f32; 1];
+            // SAFETY: dotprod detected; `r` and `t` are in range.
+            unsafe { neon::row_dots(self, r, x, t, 1, &mut v) };
+            return v[0];
+        }
         let nb = self.cols / QK;
         let xs = &x.scales[t * nb..(t + 1) * nb];
         let xq = &x.qs[t * self.cols..(t + 1) * self.cols];
@@ -383,11 +421,6 @@ impl QMatrix {
             Weights::Q8 { qs } => {
                 let wq = &qs[r * self.cols..(r + 1) * self.cols];
                 let ws = &self.scales[row0..row0 + nb];
-                #[cfg(target_arch = "aarch64")]
-                if dotprod() {
-                    // SAFETY: dotprod detected; all four slices hold exactly `nb` blocks.
-                    return unsafe { row_dot_q8_sdot(wq.as_ptr(), ws.as_ptr(), xq.as_ptr(), xs.as_ptr(), nb) };
-                }
                 for b in 0..nb {
                     let s = dot32(&wq[b * QK..(b + 1) * QK], &xq[b * QK..(b + 1) * QK]);
                     sum += ws[b] * xs[b] * s as f32;
@@ -396,11 +429,6 @@ impl QMatrix {
             Weights::Q6 { qs } => {
                 let wq = &qs[r * self.cols..(r + 1) * self.cols];
                 let ws = &self.scales[2 * row0..2 * (row0 + nb)];
-                #[cfg(target_arch = "aarch64")]
-                if dotprod() {
-                    // SAFETY: dotprod detected; slices hold exactly `nb` blocks (2*nb scales).
-                    return unsafe { row_dot_q6_sdot(wq.as_ptr(), ws.as_ptr(), xq.as_ptr(), xs.as_ptr(), nb) };
-                }
                 for b in 0..nb {
                     let (w, a) = (&wq[b * QK..(b + 1) * QK], &xq[b * QK..(b + 1) * QK]);
                     let lo = dot16(&w[..16], &a[..16]) as f32;
@@ -412,18 +440,6 @@ impl QMatrix {
                 let ws = &self.scales[row0..row0 + nb];
                 let ms = &mins[row0..row0 + nb];
                 let xsum = &x.sums[t * nb..(t + 1) * nb];
-                #[cfg(target_arch = "aarch64")]
-                if dotprod() {
-                    let (qs, qh) = match &self.w {
-                        Weights::Q4M { qs, .. } => (&qs[row0 * 16..], None),
-                        Weights::Q5M { qs, qh, .. } => (&qs[row0 * 16..], Some(qh[row0 * 4..].as_ptr())),
-                        _ => unreachable!(),
-                    };
-                    // SAFETY: dotprod detected; each slice holds at least `nb` blocks from this row on.
-                    return unsafe {
-                        row_dot_qm_sdot(qs.as_ptr(), qh, ws.as_ptr(), ms.as_ptr(), xq.as_ptr(), xs.as_ptr(), xsum.as_ptr(), nb)
-                    };
-                }
                 let mut tmp = [0i8; QK];
                 for b in 0..nb {
                     self.unpack_block(row0 + b, &mut tmp);
@@ -479,9 +495,10 @@ impl QMatrix {
         let rows = self.rows;
         debug_assert_eq!(out.len(), n * rows);
         if n == 1 {
-            out.par_chunks_mut(ROW_CHUNK).enumerate().for_each(|(c, o)| {
+            let chunk = row_chunk(rows);
+            crate::pool::for_chunks(out, chunk, |c, o| {
                 for (i, v) in o.iter_mut().enumerate() {
-                    *v = self.row_dot(c * ROW_CHUNK + i, x, 0);
+                    *v = self.row_dot(c * chunk + i, x, 0);
                 }
             });
             return;
@@ -489,9 +506,19 @@ impl QMatrix {
         // Batched: each weight row is read once and reused for every token,
         // which is what makes batched decode memory-bandwidth efficient.
         let mut tmp = vec![0f32; rows * n];
-        tmp.par_chunks_mut(ROW_CHUNK * n).enumerate().for_each(|(c, o)| {
+        crate::pool::for_chunks(&mut tmp, ROW_CHUNK * n, |c, o| {
             for (i, row_out) in o.chunks_mut(n).enumerate() {
                 let r = c * ROW_CHUNK + i;
+                #[cfg(target_arch = "aarch64")]
+                if dotprod() {
+                    // Unpack each weight block once and dot it with 4 tokens.
+                    for t0 in (0..n).step_by(4) {
+                        let cnt = (n - t0).min(4);
+                        // SAFETY: dotprod detected; `r`, `t0..t0 + cnt` are in range.
+                        unsafe { neon::row_dots(self, r, x, t0, cnt, &mut row_out[t0..t0 + cnt]) };
+                    }
+                    continue;
+                }
                 for (t, v) in row_out.iter_mut().enumerate() {
                     *v = self.row_dot(r, x, t);
                 }
@@ -506,6 +533,227 @@ impl QMatrix {
 }
 
 const ROW_CHUNK: usize = 32;
+
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    //! Row kernels for aarch64 with the dotprod extension. One generic body
+    //! is specialized per weight format (`Load`) and per token count, so the
+    //! format check sits outside the hot loop and every token count sums in
+    //! the same order: single-token and batched results are bit-identical.
+
+    use std::arch::aarch64::*;
+
+    use super::{QActs, QMatrix, Weights, QK};
+
+    /// One 32-value block: (low 16, high 16, scale per half, minimum).
+    pub(super) trait Load {
+        const HAS_MIN: bool;
+        /// The two halves have different scales (Q6); otherwise they are
+        /// summed in one `sdot` chain with a single scale multiply.
+        const SPLIT: bool = false;
+        unsafe fn load(&self, bi: usize) -> (int8x16_t, int8x16_t, f32, f32, f32);
+    }
+
+    pub(super) struct Q8<'a>(pub &'a [i8], pub &'a [f32]);
+    pub(super) struct Q6<'a>(pub &'a [i8], pub &'a [f32]);
+    pub(super) struct Q4<'a>(pub &'a [u8], pub &'a [f32]);
+    pub(super) struct Q4M<'a>(pub &'a [u8], pub &'a [f32], pub &'a [f32]);
+    pub(super) struct Q5M<'a>(pub &'a [u8], pub &'a [u8], pub &'a [f32], pub &'a [f32]);
+
+    impl Load for Q8<'_> {
+        const HAS_MIN: bool = false;
+        #[inline(always)]
+        unsafe fn load(&self, bi: usize) -> (int8x16_t, int8x16_t, f32, f32, f32) {
+            let p = self.0.as_ptr().add(bi * QK);
+            let s = *self.1.get_unchecked(bi);
+            (vld1q_s8(p), vld1q_s8(p.add(16)), s, s, 0.0)
+        }
+    }
+
+    impl Load for Q6<'_> {
+        const HAS_MIN: bool = false;
+        const SPLIT: bool = true;
+        #[inline(always)]
+        unsafe fn load(&self, bi: usize) -> (int8x16_t, int8x16_t, f32, f32, f32) {
+            let p = self.0.as_ptr().add(bi * QK);
+            (vld1q_s8(p), vld1q_s8(p.add(16)), *self.1.get_unchecked(2 * bi), *self.1.get_unchecked(2 * bi + 1), 0.0)
+        }
+    }
+
+    impl Load for Q4<'_> {
+        const HAS_MIN: bool = false;
+        #[inline(always)]
+        unsafe fn load(&self, bi: usize) -> (int8x16_t, int8x16_t, f32, f32, f32) {
+            let p = vld1q_u8(self.0.as_ptr().add(bi * 16));
+            let eight = vdupq_n_s8(8);
+            let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(p, vdupq_n_u8(0x0f))), eight);
+            let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(p)), eight);
+            let s = *self.1.get_unchecked(bi);
+            (lo, hi, s, s, 0.0)
+        }
+    }
+
+    impl Load for Q4M<'_> {
+        const HAS_MIN: bool = true;
+        #[inline(always)]
+        unsafe fn load(&self, bi: usize) -> (int8x16_t, int8x16_t, f32, f32, f32) {
+            let p = vld1q_u8(self.0.as_ptr().add(bi * 16));
+            let lo = vreinterpretq_s8_u8(vandq_u8(p, vdupq_n_u8(0x0f)));
+            let hi = vreinterpretq_s8_u8(vshrq_n_u8::<4>(p));
+            let s = *self.1.get_unchecked(bi);
+            (lo, hi, s, s, *self.2.get_unchecked(bi))
+        }
+    }
+
+    impl Load for Q5M<'_> {
+        const HAS_MIN: bool = true;
+        #[inline(always)]
+        unsafe fn load(&self, bi: usize) -> (int8x16_t, int8x16_t, f32, f32, f32) {
+            // Lane j takes bit j of the 32-bit high-bit word.
+            const IDX_LO: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1];
+            const IDX_HI: [u8; 16] = [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3];
+            const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
+            let p = vld1q_u8(self.0.as_ptr().add(bi * 16));
+            let word = std::ptr::read_unaligned(self.1.as_ptr().add(bi * 4) as *const u32);
+            let h = vreinterpretq_u8_u32(vdupq_n_u32(word));
+            let (bits, b16) = (vld1q_u8(BITS.as_ptr()), vdupq_n_u8(0x10));
+            let lo = vorrq_u8(vandq_u8(p, vdupq_n_u8(0x0f)), vandq_u8(vtstq_u8(vqtbl1q_u8(h, vld1q_u8(IDX_LO.as_ptr())), bits), b16));
+            let hi = vorrq_u8(vshrq_n_u8::<4>(p), vandq_u8(vtstq_u8(vqtbl1q_u8(h, vld1q_u8(IDX_HI.as_ptr())), bits), b16));
+            let s = *self.2.get_unchecked(bi);
+            (vreinterpretq_s8_u8(lo), vreinterpretq_s8_u8(hi), s, s, *self.3.get_unchecked(bi))
+        }
+    }
+
+    /// Blocks `row0..row0 + nb` against tokens `t0..t0 + N`. Even and odd
+    /// blocks use separate accumulators for instruction-level parallelism;
+    /// the loop is unrolled by two so both stay in registers.
+    #[target_feature(enable = "dotprod")]
+    unsafe fn kernel<L: Load, const N: usize>(l: &L, row0: usize, nb: usize, x: &QActs, t0: usize) -> [f32; N] {
+        let mut even = [vdupq_n_f32(0.0); N];
+        let mut odd = [vdupq_n_f32(0.0); N];
+        let mut min_acc = [0f32; N];
+        let cols = nb * QK;
+        let xq = x.qs.as_ptr().add(t0 * cols);
+        let xs = x.scales.as_ptr().add(t0 * nb);
+        let xsum = x.sums.as_ptr().add(t0 * nb);
+
+        #[inline(always)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn block<L: Load, const N: usize>(
+            l: &L,
+            bi: usize,
+            b: usize,
+            nb: usize,
+            cols: usize,
+            xq: *const i8,
+            xs: *const f32,
+            xsum: *const i32,
+            acc: &mut [float32x4_t; N],
+            min_acc: &mut [f32; N],
+        ) {
+            let zero = vdupq_n_s32(0);
+            let (w0, w1, s0, s1, mn) = l.load(bi);
+            for j in 0..N {
+                let xb = xq.add(j * cols + b * QK);
+                let xsb = *xs.add(j * nb + b);
+                let (x0, x1) = (vld1q_s8(xb), vld1q_s8(xb.add(16)));
+                if L::SPLIT {
+                    acc[j] = vmlaq_n_f32(acc[j], vcvtq_f32_s32(vdotq_s32(zero, w0, x0)), s0 * xsb);
+                    acc[j] = vmlaq_n_f32(acc[j], vcvtq_f32_s32(vdotq_s32(zero, w1, x1)), s1 * xsb);
+                } else {
+                    let d = vdotq_s32(vdotq_s32(zero, w0, x0), w1, x1);
+                    acc[j] = vmlaq_n_f32(acc[j], vcvtq_f32_s32(d), s0 * xsb);
+                }
+                if L::HAS_MIN {
+                    min_acc[j] += mn * xsb * *xsum.add(j * nb + b) as f32;
+                }
+            }
+        }
+
+        let mut b = 0;
+        while b + 1 < nb {
+            block::<L, N>(l, row0 + b, b, nb, cols, xq, xs, xsum, &mut even, &mut min_acc);
+            block::<L, N>(l, row0 + b + 1, b + 1, nb, cols, xq, xs, xsum, &mut odd, &mut min_acc);
+            b += 2;
+        }
+        if b < nb {
+            block::<L, N>(l, row0 + b, b, nb, cols, xq, xs, xsum, &mut even, &mut min_acc);
+        }
+        let mut out = [0f32; N];
+        for j in 0..N {
+            out[j] = vaddvq_f32(vaddq_f32(even[j], odd[j])) - min_acc[j];
+        }
+        out
+    }
+
+    #[target_feature(enable = "dotprod")]
+    unsafe fn dispatch<L: Load>(l: &L, row0: usize, nb: usize, x: &QActs, t0: usize, cnt: usize, out: &mut [f32]) {
+        match cnt {
+            1 => out[..1].copy_from_slice(&kernel::<L, 1>(l, row0, nb, x, t0)),
+            2 => out[..2].copy_from_slice(&kernel::<L, 2>(l, row0, nb, x, t0)),
+            3 => out[..3].copy_from_slice(&kernel::<L, 3>(l, row0, nb, x, t0)),
+            _ => out[..4].copy_from_slice(&kernel::<L, 4>(l, row0, nb, x, t0)),
+        }
+    }
+
+    /// Row `r` against tokens `t0..t0 + cnt` (cnt <= 4), results into `out`.
+    #[target_feature(enable = "dotprod")]
+    pub(super) unsafe fn row_dots(m: &QMatrix, r: usize, x: &QActs, t0: usize, cnt: usize, out: &mut [f32]) {
+        let nb = m.cols / QK;
+        let row0 = r * nb;
+        match &m.w {
+            Weights::Q8 { qs } => dispatch(&Q8(qs, &m.scales), row0, nb, x, t0, cnt, out),
+            Weights::Q6 { qs } => dispatch(&Q6(qs, &m.scales), row0, nb, x, t0, cnt, out),
+            Weights::Q4 { qs } => dispatch(&Q4(qs, &m.scales), row0, nb, x, t0, cnt, out),
+            Weights::Q4M { qs, mins } => dispatch(&Q4M(qs, &m.scales, mins), row0, nb, x, t0, cnt, out),
+            Weights::Q5M { qs, qh, mins } => dispatch(&Q5M(qs, qh, &m.scales, mins), row0, nb, x, t0, cnt, out),
+        }
+    }
+}
+
+/// Rows per task: about 8 tasks per thread, at least 32 rows each.
+fn row_chunk(rows: usize) -> usize {
+    let threads = crate::pool::global().threads();
+    (rows / (threads * 8)).max(ROW_CHUNK)
+}
+
+/// Several single-token matmuls on the same input in one parallel dispatch
+/// (Q/K/V, or gate/up), so the pool synchronizes once instead of per matrix.
+pub fn matmul_many(x: &QActs, jobs: &mut [(&QMatrix, &mut [f32])]) {
+    if x.n != 1 {
+        for (m, out) in jobs.iter_mut() {
+            m.matmul(x, out);
+        }
+        return;
+    }
+    // Task list: (job, first row, last row).
+    let mut tasks: Vec<(usize, usize, usize)> = Vec::new();
+    for (j, (m, out)) in jobs.iter().enumerate() {
+        assert_eq!(x.cols, m.cols);
+        assert_eq!(out.len(), m.rows);
+        let chunk = row_chunk(m.rows);
+        tasks.extend(
+            (0..m.rows)
+                .step_by(chunk)
+                .map(|r| (j, r, (r + chunk).min(m.rows))),
+        );
+    }
+    let outs: Vec<(usize, usize)> = jobs
+        .iter_mut()
+        .map(|(_, o)| (o.as_mut_ptr() as usize, o.len()))
+        .collect();
+    let mats: Vec<&QMatrix> = jobs.iter().map(|(m, _)| *m).collect();
+    crate::pool::global().run(tasks.len(), &|t| {
+        let (j, r0, r1) = tasks[t];
+        let (ptr, len) = outs[j];
+        // SAFETY: each task writes a disjoint row range of one output buffer,
+        // and the buffers outlive `run`.
+        let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, len) };
+        for (r, v) in out.iter_mut().enumerate().take(r1).skip(r0) {
+            *v = mats[j].row_dot(r, x, 0);
+        }
+    });
+}
 
 /// Activations quantized to int8 per 32-element block.
 #[derive(Debug, Default)]
@@ -613,91 +861,8 @@ unsafe fn dot32_sdot(a: *const i8, b: *const i8) -> i32 {
     vaddvq_s32(vdotq_s32(acc, vld1q_s8(a.add(16)), vld1q_s8(b.add(16))))
 }
 
-/// A whole Q8 row: block sums stay in f32 vector lanes and are reduced
-/// once per row (ggml's layout), two blocks per iteration.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "dotprod")]
-unsafe fn row_dot_q8_sdot(mut w: *const i8, ws: *const f32, mut x: *const i8, xs: *const f32, nb: usize) -> f32 {
-    use std::arch::aarch64::*;
-    let zero = vdupq_n_s32(0);
-    let (mut acc0, mut acc1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
-    let mut b = 0;
-    while b + 1 < nb {
-        let p0 = vdotq_s32(vdotq_s32(zero, vld1q_s8(w), vld1q_s8(x)), vld1q_s8(w.add(16)), vld1q_s8(x.add(16)));
-        let p1 = vdotq_s32(vdotq_s32(zero, vld1q_s8(w.add(32)), vld1q_s8(x.add(32))), vld1q_s8(w.add(48)), vld1q_s8(x.add(48)));
-        acc0 = vmlaq_n_f32(acc0, vcvtq_f32_s32(p0), *ws.add(b) * *xs.add(b));
-        acc1 = vmlaq_n_f32(acc1, vcvtq_f32_s32(p1), *ws.add(b + 1) * *xs.add(b + 1));
-        w = w.add(64);
-        x = x.add(64);
-        b += 2;
-    }
-    if b < nb {
-        let p = vdotq_s32(vdotq_s32(zero, vld1q_s8(w), vld1q_s8(x)), vld1q_s8(w.add(16)), vld1q_s8(x.add(16)));
-        acc0 = vmlaq_n_f32(acc0, vcvtq_f32_s32(p), *ws.add(b) * *xs.add(b));
-    }
-    vaddvq_f32(vaddq_f32(acc0, acc1))
-}
 
-/// A whole Q6 row: two 16-value sub-blocks with their own scales per block.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "dotprod")]
-unsafe fn row_dot_q6_sdot(w: *const i8, ws: *const f32, x: *const i8, xs: *const f32, nb: usize) -> f32 {
-    use std::arch::aarch64::*;
-    let zero = vdupq_n_s32(0);
-    let (mut acc0, mut acc1) = (vdupq_n_f32(0.0), vdupq_n_f32(0.0));
-    for b in 0..nb {
-        let (wb, xb) = (w.add(b * QK), x.add(b * QK));
-        let lo = vdotq_s32(zero, vld1q_s8(wb), vld1q_s8(xb));
-        let hi = vdotq_s32(zero, vld1q_s8(wb.add(16)), vld1q_s8(xb.add(16)));
-        let xsb = *xs.add(b);
-        acc0 = vmlaq_n_f32(acc0, vcvtq_f32_s32(lo), *ws.add(2 * b) * xsb);
-        acc1 = vmlaq_n_f32(acc1, vcvtq_f32_s32(hi), *ws.add(2 * b + 1) * xsb);
-    }
-    vaddvq_f32(vaddq_f32(acc0, acc1))
-}
 
-/// A whole Q4M/Q5M row: unsigned 4-bit nibbles (plus a fifth bit for Q5M),
-/// with per-block scale and minimum: sum(d*q*x) - sum(m*x).
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "dotprod")]
-#[allow(clippy::too_many_arguments)]
-unsafe fn row_dot_qm_sdot(
-    qs: *const u8,
-    qh: Option<*const u8>,
-    ws: *const f32,
-    ms: *const f32,
-    x: *const i8,
-    xs: *const f32,
-    xsum: *const i32,
-    nb: usize,
-) -> f32 {
-    use std::arch::aarch64::*;
-    // Lane j takes bit j of the 32-bit high-bit word (bits 0-15 low half, 16-31 high half).
-    const IDX_LO: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1];
-    const IDX_HI: [u8; 16] = [2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3];
-    const BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-    let (idx_lo, idx_hi, bits) = (vld1q_u8(IDX_LO.as_ptr()), vld1q_u8(IDX_HI.as_ptr()), vld1q_u8(BITS.as_ptr()));
-    let (mask4, b16) = (vdupq_n_u8(0x0f), vdupq_n_u8(0x10));
-    let zero = vdupq_n_s32(0);
-    let mut acc = vdupq_n_f32(0.0);
-    let mut min_sum = 0f32;
-    for b in 0..nb {
-        let p = vld1q_u8(qs.add(b * 16));
-        let mut lo = vandq_u8(p, mask4);
-        let mut hi = vshrq_n_u8::<4>(p);
-        if let Some(qh) = qh {
-            let h = vreinterpretq_u8_u32(vdupq_n_u32(std::ptr::read_unaligned(qh.add(b * 4) as *const u32)));
-            lo = vorrq_u8(lo, vandq_u8(vtstq_u8(vqtbl1q_u8(h, idx_lo), bits), b16));
-            hi = vorrq_u8(hi, vandq_u8(vtstq_u8(vqtbl1q_u8(h, idx_hi), bits), b16));
-        }
-        let xb = x.add(b * QK);
-        let d = vdotq_s32(vdotq_s32(zero, vreinterpretq_s8_u8(lo), vld1q_s8(xb)), vreinterpretq_s8_u8(hi), vld1q_s8(xb.add(16)));
-        let xsb = *xs.add(b);
-        acc = vmlaq_n_f32(acc, vcvtq_f32_s32(d), *ws.add(b) * xsb);
-        min_sum += *ms.add(b) * xsb * *xsum.add(b) as f32;
-    }
-    vaddvq_f32(acc) - min_sum
-}
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "dotprod")]
@@ -740,7 +905,10 @@ unsafe fn dot32_avx2(a: *const i8, b: *const i8) -> i32 {
     let sy = _mm256_sign_epi8(vb, va);
     let p16 = _mm256_maddubs_epi16(ax, sy);
     let p32 = _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
-    let s = _mm_add_epi32(_mm256_castsi256_si128(p32), _mm256_extracti128_si256(p32, 1));
+    let s = _mm_add_epi32(
+        _mm256_castsi256_si128(p32),
+        _mm256_extracti128_si256(p32, 1),
+    );
     let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
     let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b10_11_00_01));
     _mm_cvtsi128_si32(s)
@@ -751,7 +919,9 @@ mod tests {
     use super::*;
 
     fn lcg(seed: &mut u64) -> f32 {
-        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((*seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5
     }
 
@@ -789,7 +959,10 @@ mod tests {
             assert_eq!(dot32(&a, &b), dot32_scalar(&a, &b));
             #[cfg(target_arch = "aarch64")]
             // SAFETY: NEON is mandatory on aarch64; this checks the fallback path too.
-            assert_eq!(unsafe { dot32_neon(a.as_ptr(), b.as_ptr()) }, dot32_scalar(&a, &b));
+            assert_eq!(
+                unsafe { dot32_neon(a.as_ptr(), b.as_ptr()) },
+                dot32_scalar(&a, &b)
+            );
             assert_eq!(dot16(&a[..16], &b[..16]), dot32_scalar(&a[..16], &b[..16]));
         }
         let max = vec![-128i8; 32];
@@ -826,11 +999,27 @@ mod tests {
     #[test]
     fn repacked_types_match_dequantized_reference() {
         let (rows, cols, n) = (6, 512, 3);
-        for dtype in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Q4_1, DType::Q5_0, DType::Q5_1] {
+        for dtype in [
+            DType::Q4K,
+            DType::Q5K,
+            DType::Q6K,
+            DType::Q4_1,
+            DType::Q5_0,
+            DType::Q5_1,
+        ] {
             let mut s = 11u64;
-            let n_blocks = rows * cols / if matches!(dtype, DType::Q4K | DType::Q5K | DType::Q6K) { QK_K } else { QK };
+            let n_blocks = rows * cols
+                / if matches!(dtype, DType::Q4K | DType::Q5K | DType::Q6K) {
+                    QK_K
+                } else {
+                    QK
+                };
             let data = random_blocks(dtype, n_blocks, &mut s);
-            let info = TensorInfo { dims: vec![cols, rows], dtype, offset: 0 };
+            let info = TensorInfo {
+                dims: vec![cols, rows],
+                dtype,
+                offset: 0,
+            };
             let dense = to_f32(&info, &data).unwrap();
             let m = QMatrix::from_gguf(&info, &data).unwrap();
 
@@ -838,7 +1027,10 @@ mod tests {
             for r in 0..rows {
                 m.dequant_row(r, &mut row);
                 for c in 0..cols {
-                    assert!((row[c] - dense[r * cols + c]).abs() < 1e-5, "{dtype:?} r{r} c{c}");
+                    assert!(
+                        (row[c] - dense[r * cols + c]).abs() < 1e-5,
+                        "{dtype:?} r{r} c{c}"
+                    );
                 }
             }
 
@@ -848,14 +1040,65 @@ mod tests {
             let mut out = vec![0f32; n * rows];
             m.matmul(&qa, &mut out);
             // Reference uses the same int8 activations, so only float rounding remains.
-            let xd: Vec<f32> = (0..n * cols).map(|i| qa.scales[i / QK] * qa.qs[i] as f32).collect();
+            let xd: Vec<f32> = (0..n * cols)
+                .map(|i| qa.scales[i / QK] * qa.qs[i] as f32)
+                .collect();
             for t in 0..n {
                 for r in 0..rows {
-                    let want: f32 = (0..cols).map(|c| dense[r * cols + c] * xd[t * cols + c]).sum();
+                    let want: f32 = (0..cols)
+                        .map(|c| dense[r * cols + c] * xd[t * cols + c])
+                        .sum();
                     let got = out[t * rows + r];
-                    let tol = 1e-4 * (0..cols).map(|c| (dense[r * cols + c] * xd[t * cols + c]).abs()).sum::<f32>().max(1.0);
-                    assert!((got - want).abs() < tol, "{dtype:?} t{t} r{r}: {got} vs {want}");
+                    let tol = 1e-4
+                        * (0..cols)
+                            .map(|c| (dense[r * cols + c] * xd[t * cols + c]).abs())
+                            .sum::<f32>()
+                            .max(1.0);
+                    assert!(
+                        (got - want).abs() < tol,
+                        "{dtype:?} t{t} r{r}: {got} vs {want}"
+                    );
                 }
+            }
+        }
+    }
+
+    /// The 4-token batched kernel must agree with the single-token path.
+    #[test]
+    fn batched_matches_single_token_for_every_type() {
+        let (rows, cols, n) = (40, 512, 7);
+        for dtype in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Q4_1, DType::Q5_0, DType::Q5_1] {
+            let mut s = 3u64;
+            let n_blocks = rows * cols / if matches!(dtype, DType::Q4K | DType::Q5K | DType::Q6K) { QK_K } else { QK };
+            let data = random_blocks(dtype, n_blocks, &mut s);
+            let m = QMatrix::from_gguf(&TensorInfo { dims: vec![cols, rows], dtype, offset: 0 }, &data).unwrap();
+            check_batched(&m, n, &mut s);
+        }
+        let mut s = 5u64;
+        let w: Vec<f32> = (0..rows * cols).map(|_| lcg(&mut s)).collect();
+        check_batched(&QMatrix::from_f32(&w, rows, cols), n, &mut s);
+        let q4: Vec<u8> = random_bytes(rows * cols / QK * 18, &mut s);
+        let mut q4 = q4;
+        for blk in q4.chunks_exact_mut(18) {
+            blk[..2].copy_from_slice(&f16::from_f32(0.01).to_le_bytes());
+        }
+        check_batched(&QMatrix::from_gguf(&TensorInfo { dims: vec![cols, rows], dtype: DType::Q4_0, offset: 0 }, &q4).unwrap(), n, &mut s);
+    }
+
+    fn check_batched(m: &QMatrix, n: usize, s: &mut u64) {
+        let x: Vec<f32> = (0..n * m.cols).map(|_| lcg(s)).collect();
+        let mut qa = QActs::default();
+        qa.quantize(&x, n, m.cols);
+        let mut batched = vec![0f32; n * m.rows];
+        m.matmul(&qa, &mut batched);
+        for t in 0..n {
+            let mut one = QActs::default();
+            one.quantize(&x[t * m.cols..(t + 1) * m.cols], 1, m.cols);
+            let mut single = vec![0f32; m.rows];
+            m.matmul(&one, &mut single);
+            for r in 0..m.rows {
+                let (a, b) = (batched[t * m.rows + r], single[r]);
+                assert!((a - b).abs() <= 1e-4 * b.abs().max(1.0), "t{t} r{r}: {a} vs {b}");
             }
         }
     }
