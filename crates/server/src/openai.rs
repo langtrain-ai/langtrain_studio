@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use futures::stream::{self, Stream, StreamExt};
 use langtrain_engine::sampling::SamplingParams;
 use langtrain_engine::{ChatMessage, Event, FinishReason, Prompt, Usage};
@@ -14,6 +14,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::billing::Caller;
 use crate::state::{unix_now, ApiError, AppState};
 
 #[derive(Debug, Deserialize)]
@@ -137,13 +138,17 @@ pub async fn collect(mut rx: UnboundedReceiver<Event>) -> Result<(String, Finish
     Err(ApiError(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "engine stopped".into()))
 }
 
-pub async fn chat_completions(State(state): State<Arc<AppState>>, Json(mut req): Json<ChatRequest>) -> Result<Response, ApiError> {
+pub async fn chat_completions(
+    State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
+    Json(mut req): Json<ChatRequest>,
+) -> Result<Response, ApiError> {
     let messages: Vec<ChatMessage> = req.messages.iter().map(|m| ChatMessage::new(&m.role, content_text(&m.content))).collect();
     if messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
     let params = req.common.sampling();
-    let rx = state.generate(&req.common.model, Prompt::Chat(messages), params).await?;
+    let rx = state.generate_for(caller.as_deref(), &req.common.model, Prompt::Chat(messages), params).await?;
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
     let model = req.common.model.clone();
 
@@ -181,9 +186,13 @@ pub async fn chat_completions(State(state): State<Arc<AppState>>, Json(mut req):
     .into_response())
 }
 
-pub async fn completions(State(state): State<Arc<AppState>>, Json(mut req): Json<CompletionRequest>) -> Result<Response, ApiError> {
+pub async fn completions(
+    State(state): State<Arc<AppState>>,
+    caller: Option<Extension<Caller>>,
+    Json(mut req): Json<CompletionRequest>,
+) -> Result<Response, ApiError> {
     let params = req.common.sampling();
-    let rx = state.generate(&req.common.model, Prompt::Text(req.prompt.clone()), params).await?;
+    let rx = state.generate_for(caller.as_deref(), &req.common.model, Prompt::Text(req.prompt.clone()), params).await?;
     let id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     let model = req.common.model.clone();
 

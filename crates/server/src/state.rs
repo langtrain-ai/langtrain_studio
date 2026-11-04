@@ -14,6 +14,9 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{mpsc, Mutex};
 
+use std::sync::atomic::AtomicBool;
+
+use crate::billing::{format_money, Billing, Caller, Refusal};
 use crate::tune::Jobs;
 
 /// Name of the built-in test model, available with `--mock`.
@@ -31,6 +34,8 @@ pub struct ServerConfig {
     pub hardware: Hardware,
     pub profile: Profile,
     pub backend: BackendChoice,
+    /// Langtrain Cloud mode: API keys, prepaid credits and metering.
+    pub cloud: bool,
 }
 
 /// Which inference engine serves GGUF models.
@@ -110,12 +115,18 @@ pub struct AppState {
     pub config: ServerConfig,
     loaded: Mutex<Option<Loaded>>,
     pub jobs: Jobs,
+    pub billing: Option<Arc<Billing>>,
 }
 
 impl AppState {
-    pub fn new(config: ServerConfig) -> Arc<Self> {
+    pub fn new(config: ServerConfig) -> Result<Arc<Self>> {
+        let billing = if config.cloud { Some(Arc::new(Billing::open(&config.home)?)) } else { None };
+        Ok(Self::with_billing(config, billing))
+    }
+
+    pub fn with_billing(config: ServerConfig, billing: Option<Arc<Billing>>) -> Arc<Self> {
         let jobs = Jobs::new(config.jobs_dir());
-        Arc::new(Self { config, loaded: Mutex::new(None), jobs })
+        Arc::new(Self { config, loaded: Mutex::new(None), jobs, billing })
     }
 
     pub fn adapter_files(&self, base: &str) -> BTreeMap<String, PathBuf> {
@@ -264,14 +275,69 @@ impl AppState {
 
     /// Resolve a model name and start generating. Events arrive on the returned channel.
     pub async fn generate(&self, model: &str, prompt: Prompt, params: SamplingParams) -> Result<mpsc::UnboundedReceiver<Event>> {
+        Ok(self.start(model, prompt, params).await?.0)
+    }
+
+    async fn start(&self, model: &str, prompt: Prompt, params: SamplingParams) -> Result<(mpsc::UnboundedReceiver<Event>, Arc<AtomicBool>)> {
         let (base, adapter) = parse_model_name(model);
         if base.is_empty() {
             return Err(anyhow!("model is required"));
         }
         let engine = self.engine(&base).await?;
         let (tx, rx) = mpsc::unbounded_channel();
-        engine.submit(GenerateRequest { prompt, params, adapter, events: tx })?;
-        Ok(rx)
+        let req = GenerateRequest::new(prompt, params, adapter, tx);
+        let cancel = req.cancel.clone();
+        engine.submit(req)?;
+        Ok((rx, cancel))
+    }
+
+    /// Generate on behalf of an API caller. In cloud mode the request is paid
+    /// for first: its worst-case cost is held from the caller's credit (402 if
+    /// short), and the actual cost is charged when it ends.
+    pub async fn generate_for(
+        &self,
+        caller: Option<&Caller>,
+        model: &str,
+        prompt: Prompt,
+        mut params: SamplingParams,
+    ) -> Result<mpsc::UnboundedReceiver<Event>, ApiError> {
+        let Some(billing) = &self.billing else {
+            return Ok(self.generate(model, prompt, params).await?);
+        };
+        let caller = caller.ok_or_else(|| ApiError(StatusCode::UNAUTHORIZED, "missing API key".into()))?;
+        let max_tokens = billing.clamp_max_tokens(params.max_tokens);
+        params.max_tokens = Some(max_tokens);
+        let (bytes, messages) = match &prompt {
+            Prompt::Text(t) => (t.len(), 1),
+            Prompt::Chat(m) => (m.iter().map(|x| x.role.len() + x.content.len()).sum(), m.len()),
+            Prompt::Tokens(t) => (t.len(), 1),
+        };
+        let (base, _) = parse_model_name(model);
+        let price = billing.price(&base, caller.account.currency);
+        let estimate = Billing::estimate(price, bytes, messages, max_tokens);
+        let admission = match billing.admit(caller, estimate)? {
+            Ok(a) => a,
+            Err(Refusal::InsufficientCredit { available, needed, currency }) => {
+                return Err(ApiError(
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!(
+                        "insufficient credit: this request can cost up to {} and your balance is {}. Add credits at {}/#billing",
+                        format_money(needed, currency),
+                        format_money(available, currency),
+                        billing.config.public_url.trim_end_matches('/')
+                    ),
+                ))
+            }
+            Err(Refusal::TooManyRequests { limit }) => {
+                return Err(ApiError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("too many requests at once: this account can run {limit} at a time"),
+                ))
+            }
+        };
+        // If starting fails, dropping `admission` releases the hold.
+        let (rx, cancel) = self.start(model, prompt, params).await?;
+        Ok(Billing::meter(admission, model.to_string(), price, rx, cancel))
     }
 }
 

@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -32,6 +35,20 @@ pub struct GenerateRequest {
     /// LoRA adapter to apply, by name. `None` serves the base model.
     pub adapter: Option<String>,
     pub events: mpsc::UnboundedSender<Event>,
+    /// Set to stop generation early. Unlike dropping `events`, the engine
+    /// still reports a final `Done` with usage, which billing needs.
+    pub cancel: Arc<AtomicBool>,
+}
+
+impl GenerateRequest {
+    pub fn new(prompt: Prompt, params: SamplingParams, adapter: Option<String>, events: mpsc::UnboundedSender<Event>) -> Self {
+        Self { prompt, params, adapter, events, cancel: Arc::new(AtomicBool::new(false)) }
+    }
+
+    /// The client is gone or asked to stop.
+    pub fn is_cancelled(&self) -> bool {
+        self.events.is_closed() || self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

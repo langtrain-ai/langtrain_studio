@@ -16,9 +16,18 @@ const fmtSecs = (s) => {
   return (s / 3600).toFixed(1) + " h";
 };
 
+// Langtrain Cloud: the API key lives in this browser only.
+const KEY_STORE = "lt.apiKey";
+function apiKey() { return safeGet(KEY_STORE); }
+function authHeaders(extra = {}) {
+  const k = apiKey();
+  return k ? { ...extra, authorization: "Bearer " + k } : extra;
+}
+let cloud = false;
+
 async function api(path, opts = {}) {
   const res = await fetch(path, {
-    headers: { "content-type": "application/json" },
+    headers: authHeaders({ "content-type": "application/json" }),
     ...opts,
     body: opts.body && typeof opts.body !== "string" ? JSON.stringify(opts.body) : opts.body,
   });
@@ -28,7 +37,7 @@ async function api(path, opts = {}) {
 }
 
 // ---------- navigation ----------
-const views = { chat: null, models: loadModels, tune: loadTune, system: loadSystem };
+const views = { chat: null, models: loadModels, tune: loadTune, system: loadSystem, billing: loadBilling };
 document.querySelectorAll(".nav").forEach((b) =>
   b.addEventListener("click", () => show(b.dataset.view))
 );
@@ -96,11 +105,18 @@ async function streamChat(model, out) {
   try {
     const res = await fetch("/v1/chat/completions", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ model, messages, stream: true, temperature: +$("#chat-temp").value, stream_options: { include_usage: true } }),
       signal: controller.signal,
     });
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error?.message || res.statusText);
+    if (!res.ok) {
+      const msg = (await res.json().catch(() => ({}))).error?.message || res.statusText;
+      if (cloud && (res.status === 401 || res.status === 402)) {
+        // Send the person to the place that fixes it.
+        setTimeout(() => show("billing"), 1200);
+      }
+      throw new Error(msg);
+    }
     const reader = res.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -151,7 +167,7 @@ async function streamChat(model, out) {
 // ---------- models ----------
 async function loadModels() {
   const sys = await api("/v1/system");
-  $("#models-dir").textContent = sys.models_dir;
+  $("#models-dir").textContent = sys.models_dir || "the server's model folder";
   const body = $("#models-body");
   body.replaceChildren();
   for (const m of sys.models) {
@@ -300,6 +316,10 @@ async function loadSystem() {
 }
 
 async function loadLoaded() {
+  if (cloud) {
+    $("#loaded-model").textContent = apiKey() ? "Langtrain Cloud" : "Langtrain Cloud · not signed in";
+    return;
+  }
   try {
     const s = await api("/v1/system");
     $("#loaded-model").textContent = s.loaded ? `Loaded: ${s.loaded.model}\n${s.loaded.info.backend}` : "No model loaded";
@@ -307,7 +327,244 @@ async function loadLoaded() {
 }
 
 // ---------- boot ----------
-refreshModelIds().catch((e) => addMsg("assistant error", "Cannot reach the Langtrain daemon: " + e.message));
-loadLoaded();
-const startView = safeGet("lt.view");
-if (startView && startView in views) show(startView);
+// ---------- billing (Langtrain Cloud) ----------
+let billingConfig = null;
+// Usage charges are often a fraction of a paisa, so small amounts get more decimals.
+const money = (micro, cur) => {
+  const v = Math.abs(micro) / 1e6;
+  const digits = v > 0 && v < 1 ? 4 : 2;
+  const text = v.toLocaleString(cur === "USD" ? "en-US" : "en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+  return (micro < 0 ? "−" : "") + (cur === "USD" ? "$" : "₹") + text;
+};
+const when = (unix) => (unix ? new Date(unix * 1000).toLocaleString() : "never");
+const KIND_LABEL = { topup: "Credit purchase", bonus: "Bonus credit", grant: "Credit from Langtrain", charge: "Usage", refund: "Refund", expiry: "Expired credit" };
+
+function toast(text) {
+  const t = el("div", "toast", text);
+  t.setAttribute("role", "status");
+  document.body.append(t);
+  setTimeout(() => t.remove(), 5000);
+}
+
+function showNewKey(secret) {
+  $("#bill-newkey").hidden = false;
+  $("#bill-newkey-value").textContent = secret;
+}
+
+$("#bill-copy").addEventListener("click", async () => {
+  const v = $("#bill-newkey-value").textContent;
+  try {
+    await navigator.clipboard.writeText(v);
+    toast("API key copied");
+  } catch {
+    const r = document.createRange();
+    r.selectNodeContents($("#bill-newkey-value"));
+    getSelection().removeAllRanges();
+    getSelection().addRange(r);
+  }
+});
+
+$("#bill-signup").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("#bill-signin-error").textContent = "";
+  try {
+    const r = await api("/v1/signup", { method: "POST", body: { email: $("#bill-email").value.trim(), currency: $("#bill-currency").value } });
+    try { localStorage.setItem(KEY_STORE, r.api_key); } catch {}
+    showNewKey(r.api_key);
+    loadBilling();
+    loadLoaded();
+  } catch (err) {
+    $("#bill-signin-error").textContent = err.message;
+  }
+});
+
+$("#bill-usekey").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const k = $("#bill-key").value.trim();
+  if (!k) return;
+  try { localStorage.setItem(KEY_STORE, k); } catch {}
+  $("#bill-key").value = "";
+  loadBilling();
+});
+
+$("#bill-signout").addEventListener("click", () => {
+  try { localStorage.removeItem(KEY_STORE); } catch {}
+  $("#bill-newkey").hidden = true;
+  loadBilling();
+});
+
+$("#bill-keyform").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  try {
+    const r = await api("/v1/keys", { method: "POST", body: { name: $("#bill-keyname").value.trim() } });
+    $("#bill-keyname").value = "";
+    showNewKey(r.api_key);
+    loadBilling();
+  } catch (err) {
+    toast(err.message);
+  }
+});
+
+function loadRazorpay() {
+  return new Promise((resolve, reject) => {
+    if (window.Razorpay) return resolve();
+    const s = document.createElement("script");
+    s.src = "https://checkout.razorpay.com/v1/checkout.js";
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("Could not load Razorpay. Check your connection and try again."));
+    document.head.append(s);
+  });
+}
+
+async function buy(pack) {
+  $("#bill-pay-error").textContent = "";
+  try {
+    const r = await api("/v1/billing/checkout", { method: "POST", body: { pack_id: pack.id } });
+    if (r.provider === "stripe") {
+      location.href = r.url;
+      return;
+    }
+    await loadRazorpay();
+    const rzp = new window.Razorpay({
+      key: r.key_id,
+      order_id: r.order_id,
+      amount: r.amount,
+      currency: r.currency,
+      name: r.name,
+      description: r.description,
+      prefill: { email: r.email },
+      theme: { color: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#3a5bd9" },
+      handler: () => paymentReceived(),
+    });
+    rzp.on("payment.failed", (resp) => {
+      $("#bill-pay-error").textContent = "Payment failed: " + (resp.error?.description || "please try another method.");
+    });
+    rzp.open();
+  } catch (err) {
+    $("#bill-pay-error").textContent = err.message;
+  }
+}
+
+// Credits are added by the provider's webhook, which can lag the browser by a few seconds.
+async function paymentReceived() {
+  toast("Payment received. Your credits will appear in a few seconds.");
+  const before = (await api("/v1/account").catch(() => null))?.balance;
+  for (let i = 0; i < 15; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const now = (await api("/v1/account").catch(() => null))?.balance;
+    if (now !== undefined && now !== before) break;
+  }
+  loadBilling();
+}
+
+async function loadBilling() {
+  if (!cloud) return;
+  billingConfig = billingConfig || (await api("/v1/billing/config").catch(() => null));
+  const signedIn = !!apiKey();
+  let acct = null;
+  if (signedIn) {
+    acct = await api("/v1/account").catch((err) => {
+      $("#bill-signin-error").textContent = err.message + ". Paste a valid key or create an account.";
+      try { localStorage.removeItem(KEY_STORE); } catch {}
+      return null;
+    });
+  }
+  $("#bill-signin").hidden = !!acct;
+  $("#bill-account").hidden = !acct;
+  $("#bill-signup").hidden = !billingConfig?.open_signup;
+  if (!acct) return;
+
+  const cur = acct.account.currency;
+  $("#bill-balance").textContent = money(acct.balance, cur);
+  $("#bill-held").textContent = acct.held > 0 ? `${money(acct.held, cur)} reserved by requests that are running` : "";
+  $("#bill-who").textContent = acct.account.email;
+  const p = acct.prices;
+  $("#bill-prices").textContent =
+    `Per million tokens: ${cur === "USD" ? "$" : "₹"}${p.input_per_m} input, ${cur === "USD" ? "$" : "₹"}${p.cached_input_per_m} cached input, ${cur === "USD" ? "$" : "₹"}${p.output_per_m} output. ` +
+    `Each request reserves its largest possible cost before it runs and is charged only for what it used.`;
+
+  const packs = (billingConfig?.packs || []).filter((x) => x.currency === cur);
+  const box = $("#bill-packs");
+  box.replaceChildren();
+  const providers = billingConfig?.providers || {};
+  const canPay = providers.razorpay || providers.stripe;
+  for (const pk of packs) {
+    const b = el("button", "pack");
+    b.type = "button";
+    b.disabled = !canPay;
+    b.append(el("span", "amt", (cur === "USD" ? "$" : "₹") + pk.amount.toLocaleString(cur === "USD" ? "en-US" : "en-IN")));
+    if (pk.bonus_pct) b.append(el("span", "bonus", `+${pk.bonus_pct}% bonus`));
+    b.onclick = () => buy(pk);
+    box.append(b);
+  }
+  $("#bill-pay-note").textContent = canPay
+    ? cur === "INR" ? "Pay with UPI, cards or netbanking. GST invoice by email." : "Pay by card. Receipt by email."
+    : "Online payment is not set up on this server yet. Contact the operator to add credit.";
+
+  const [keys, usage, ledger] = await Promise.all([
+    api("/v1/keys").catch(() => ({ data: [] })),
+    api("/v1/usage").catch(() => ({ data: [] })),
+    api("/v1/billing/ledger").catch(() => ({ data: [] })),
+  ]);
+  const kb = $("#bill-keys");
+  kb.replaceChildren(...keys.data.filter((k) => !k.revoked).map((k) => {
+    const tr = el("tr");
+    tr.append(el("td", "", k.name), el("td", "", k.prefix + "…"), el("td", "", when(k.created_at)), el("td", "", when(k.last_used_at)));
+    const td = el("td");
+    if (k.id === keys.current) {
+      td.append(el("span", "pill", "this browser"));
+    } else {
+      const r = el("button", "small ghost", "Revoke");
+      r.onclick = async () => {
+        if (r.dataset.confirm !== "1") { r.dataset.confirm = "1"; r.textContent = "Click again to revoke"; return; }
+        await api(`/v1/keys/${k.id}`, { method: "DELETE" }).catch((err) => toast(err.message));
+        loadBilling();
+      };
+      td.append(r);
+    }
+    tr.append(td);
+    return tr;
+  }));
+  const ub = $("#bill-usage");
+  ub.replaceChildren(...usage.data.slice(0, 50).map((u) => {
+    const tr = el("tr");
+    const prompt = u.cached_tokens ? `${u.prompt_tokens} (${u.cached_tokens} cached)` : String(u.prompt_tokens);
+    tr.append(el("td", "", when(u.created_at)), el("td", "", u.model), el("td", "", prompt), el("td", "", String(u.completion_tokens)), el("td", "amount-neg", money(u.cost, cur)));
+    return tr;
+  }));
+  if (!usage.data.length) ub.append(Object.assign(el("tr"), { innerHTML: '<td colspan="5" class="muted">No requests yet.</td>' }));
+  const lb = $("#bill-ledger");
+  lb.replaceChildren(...ledger.data.map((e) => {
+    const tr = el("tr");
+    const label = KIND_LABEL[e.kind] || e.kind;
+    tr.append(el("td", "", when(e.created_at)), el("td", "", e.note ? `${label} · ${e.note}` : label), el("td", e.amount > 0 ? "amount-pos" : "amount-neg", (e.amount > 0 ? "+" : "") + money(e.amount, cur)));
+    return tr;
+  }));
+}
+
+// ---------- boot ----------
+async function boot() {
+  const sys = await api("/v1/system").catch(() => null);
+  cloud = !!sys?.cloud;
+  if (cloud) {
+    // Customers see Chat, Models and Billing; hardware and training are operator tools.
+    document.querySelector('[data-view="billing"]').hidden = false;
+    document.querySelector('[data-view="tune"]').hidden = true;
+    document.querySelector('[data-view="system"]').hidden = true;
+  }
+  refreshModelIds().catch((e) => addMsg("assistant error", "Cannot reach the Langtrain server: " + e.message));
+  loadLoaded();
+  const params = new URLSearchParams(location.search);
+  if (cloud && params.get("checkout")) {
+    history.replaceState(null, "", location.pathname + location.hash);
+    if (params.get("checkout") === "success") paymentReceived();
+    show("billing");
+    return;
+  }
+  const hash = location.hash.replace("#", "");
+  const startView = hash in views ? hash : safeGet("lt.view");
+  const allowed = (v) => v && v in views && !document.querySelector(`[data-view="${v}"]`)?.hidden;
+  if (allowed(startView)) show(startView);
+  else if (cloud && !apiKey()) show("billing");
+}
+boot();

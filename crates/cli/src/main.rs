@@ -40,6 +40,36 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum BillingCmd {
+    /// List accounts with their balances.
+    Accounts,
+    /// Create an account and print its first API key.
+    Create {
+        #[arg(long)]
+        email: String,
+        #[arg(long, default_value = "INR")]
+        currency: String,
+    },
+    /// Issue a new API key for an account (for example, a lost key).
+    NewKey {
+        #[arg(long)]
+        email: String,
+        #[arg(long, default_value = "cli")]
+        name: String,
+    },
+    /// Add credit by hand: refunds, goodwill or offline payments.
+    Grant {
+        #[arg(long)]
+        email: String,
+        /// Whole currency units (rupees or dollars).
+        #[arg(long)]
+        amount: f64,
+        #[arg(long)]
+        note: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Run the API server and Studio web UI.
     Serve {
@@ -51,6 +81,14 @@ enum Cmd {
         /// Expose the built-in `mock` model (for UI development and tests).
         #[arg(long)]
         mock: bool,
+        /// Langtrain Cloud: require API keys and prepaid credits for every request.
+        #[arg(long, env = "LANGTRAIN_CLOUD")]
+        cloud: bool,
+    },
+    /// Manage Langtrain Cloud accounts and credits (operator).
+    Billing {
+        #[command(subcommand)]
+        cmd: BillingCmd,
     },
     /// Chat with a model in the terminal (no server needed).
     Run {
@@ -142,6 +180,7 @@ fn config(home: PathBuf, mock: bool) -> ServerConfig {
         hardware: hw,
         profile,
         backend,
+        cloud: false,
     }
 }
 
@@ -159,10 +198,13 @@ async fn main() -> Result<()> {
     let _ = BACKEND.set(cli.backend);
     let _ = OVERRIDES.set((cli.parallel, cli.ctx, cli.threads));
     match cli.cmd {
-        Cmd::Serve { host, port, mock } => {
+        Cmd::Serve { host, port, mock, cloud } => {
             let addr: SocketAddr = format!("{host}:{port}").parse().context("invalid host/port")?;
-            langtrain_server::serve(config(home, mock), addr).await
+            let mut cfg = config(home, mock);
+            cfg.cloud = cloud;
+            langtrain_server::serve(cfg, addr).await
         }
+        Cmd::Billing { cmd } => billing(home, cmd),
         Cmd::Run { model, prompt, temperature, max_tokens } => run(home, model, prompt, temperature, max_tokens).await,
         Cmd::List => list(home),
         Cmd::Pull { repo_or_url, file, name } => pull(home, repo_or_url, file, name).await,
@@ -202,7 +244,7 @@ async fn stream_to_stdout(mut rx: tokio::sync::mpsc::UnboundedReceiver<Event>) -
 }
 
 async fn run(home: PathBuf, model: String, prompt: Option<String>, temperature: f32, max_tokens: Option<usize>) -> Result<()> {
-    let state = AppState::new(config(home, model == "mock"));
+    let state = AppState::new(config(home, model == "mock"))?;
     let params = SamplingParams { temperature, max_tokens, ..Default::default() };
     if let Some(p) = prompt {
         let rx = state.generate(&model, Prompt::Chat(vec![ChatMessage::new("user", p)]), params).await?;
@@ -226,7 +268,7 @@ async fn run(home: PathBuf, model: String, prompt: Option<String>, temperature: 
 }
 
 fn list(home: PathBuf) -> Result<()> {
-    let state = AppState::new(config(home, false));
+    let state = AppState::new(config(home, false))?;
     let models = state.list_models();
     if models.is_empty() {
         println!("No models in {}. Try:\n  langtrain pull bartowski/Qwen2.5-1.5B-Instruct-GGUF Qwen2.5-1.5B-Instruct-Q4_K_M.gguf", state.config.models_dir().display());
@@ -285,6 +327,41 @@ async fn pull(home: PathBuf, repo_or_url: String, file: Option<String>, name: Op
     Ok(())
 }
 
+fn billing(home: PathBuf, cmd: BillingCmd) -> Result<()> {
+    use langtrain_server::billing::store::{Currency, MICRO};
+    use langtrain_server::billing::{format_money, Billing};
+    let b = Billing::open(&home)?;
+    let find = |email: &str| -> Result<_> {
+        b.store.account_by_email(email)?.with_context(|| format!("no account with email {email}"))
+    };
+    match cmd {
+        BillingCmd::Accounts => {
+            for (a, bal) in b.store.accounts()? {
+                let state = if a.disabled { "  (disabled)" } else { "" };
+                println!("{:<36} {:<24} {:>14}{state}", a.email, a.id, format_money(bal.available, a.currency));
+            }
+        }
+        BillingCmd::Create { email, currency } => {
+            let a = b.store.create_account(&email, Currency::parse(&currency)?)?;
+            let (_, secret) = b.store.create_key(&a.id, "default")?;
+            println!("Created {} ({}).\nAPI key (shown once): {secret}", a.email, a.id);
+        }
+        BillingCmd::NewKey { email, name } => {
+            let a = find(&email)?;
+            let (_, secret) = b.store.create_key(&a.id, &name)?;
+            println!("New key for {} (shown once): {secret}", a.email);
+        }
+        BillingCmd::Grant { email, amount, note } => {
+            let a = find(&email)?;
+            let micro = (amount * MICRO as f64).round() as i64;
+            b.store.credit(&a.id, "grant", micro, None, note.as_deref(), None)?;
+            let bal = b.store.balance(&a.id)?;
+            println!("Granted {} to {}. Balance: {}", format_money(micro, a.currency), a.email, format_money(bal.available, a.currency));
+        }
+    }
+    Ok(())
+}
+
 fn doctor() -> Result<()> {
     let hw = hardware::detect();
     let profile = hw.profile();
@@ -293,7 +370,7 @@ fn doctor() -> Result<()> {
 }
 
 async fn bench(home: PathBuf, model: String, concurrency: Vec<usize>, tokens: usize) -> Result<()> {
-    let state = AppState::new(config(home, model == "mock"));
+    let state = AppState::new(config(home, model == "mock"))?;
     let params = SamplingParams { max_tokens: Some(tokens), temperature: 0.0, ..Default::default() };
     let system = "You are a concise assistant. Answer in plain prose. ".repeat(20);
     let topics = ["rivers", "volcanoes", "bridges", "compilers", "bees", "tides", "glass", "maps"];

@@ -15,6 +15,7 @@
       <button class="nav" data-view="models">Models</button>
       <button class="nav" data-view="tune">Fine-tune</button>
       <button class="nav" data-view="system">System</button>
+      <button class="nav" data-view="billing" hidden>Billing</button>
       <div class="sidebar-foot" id="loaded-model">No model loaded</div>
     </nav>
 
@@ -86,6 +87,68 @@
         </div>
         <h2>Jobs</h2>
         <div id="jobs"></div>
+      </section>
+
+      <!-- Billing (Langtrain Cloud) -->
+      <section class="view" id="view-billing">
+        <header class="toolbar"><h1>Billing</h1></header>
+
+        <div class="card" id="bill-signin">
+          <h2>Sign in to Langtrain Cloud</h2>
+          <p class="muted">Requests run on our GPUs and are paid for from prepaid credit. Create an account to get an API key, or paste a key you already have.</p>
+          <div class="grid2">
+            <form id="bill-signup" class="stack">
+              <label>Email <input id="bill-email" type="email" required autocomplete="email"></label>
+              <label>Pay in
+                <select id="bill-currency"><option value="INR">₹ Indian rupees</option><option value="USD">$ US dollars</option></select>
+              </label>
+              <button type="submit">Create account</button>
+            </form>
+            <form id="bill-usekey" class="stack">
+              <label>API key <input id="bill-key" autocomplete="off" placeholder="lt_live_…"></label>
+              <button type="submit" class="ghost">Use this key</button>
+            </form>
+          </div>
+          <p class="error" id="bill-signin-error"></p>
+        </div>
+
+        <div class="card reveal" id="bill-newkey" hidden>
+          <h2>Your new API key</h2>
+          <p class="muted">Copy it now: it is shown only once. Studio keeps it in this browser.</p>
+          <div class="keyrow"><code id="bill-newkey-value"></code><button type="button" class="small" id="bill-copy">Copy</button></div>
+        </div>
+
+        <div id="bill-account" hidden>
+          <div class="grid2">
+            <div class="card">
+              <h2>Balance</h2>
+              <div class="balance" id="bill-balance">–</div>
+              <p class="muted" id="bill-held"></p>
+              <p class="muted" id="bill-who"></p>
+              <button type="button" class="small ghost" id="bill-signout">Sign out of this browser</button>
+            </div>
+            <div class="card">
+              <h2>Add credits</h2>
+              <div class="packs" id="bill-packs"></div>
+              <p class="hint" id="bill-pay-note"></p>
+              <p class="error" id="bill-pay-error"></p>
+            </div>
+          </div>
+          <div class="card">
+            <h2>Prices</h2>
+            <p class="muted" id="bill-prices"></p>
+          </div>
+          <h2>API keys</h2>
+          <form class="toolbar" id="bill-keyform">
+            <input id="bill-keyname" placeholder="Key name, for example laptop" maxlength="64">
+            <button type="submit" class="small">Create key</button>
+          </form>
+          <table class="table"><thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody id="bill-keys"></tbody></table>
+          <h2>Recent requests</h2>
+          <table class="table"><thead><tr><th>When</th><th>Model</th><th>Prompt</th><th>Output</th><th>Cost</th></tr></thead><tbody id="bill-usage"></tbody></table>
+          <h2>Credit history</h2>
+          <table class="table"><thead><tr><th>When</th><th>What</th><th>Amount</th></tr></thead><tbody id="bill-ledger"></tbody></table>
+        </div>
       </section>
 
       <!-- System -->

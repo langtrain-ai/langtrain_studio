@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use futures::stream::{self, StreamExt};
 use langtrain_engine::sampling::SamplingParams;
 use langtrain_engine::{ChatMessage, Event, Prompt, Usage};
@@ -16,6 +16,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::openai::{collect, content_text, InMessage};
+use crate::billing::Caller;
 use crate::state::{ApiError, AppState};
 
 fn rfc3339(t: SystemTime) -> String {
@@ -161,7 +162,7 @@ where
     ([(header::CONTENT_TYPE, "application/x-ndjson")], Body::from_stream(lines)).into_response()
 }
 
-pub async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatRequest>) -> Result<Response, ApiError> {
+pub async fn chat(State(state): State<Arc<AppState>>, caller: Option<Extension<Caller>>, Json(req): Json<ChatRequest>) -> Result<Response, ApiError> {
     let messages: Vec<ChatMessage> = req.messages.iter().map(|m| ChatMessage::new(&m.role, content_text(&m.content))).collect();
     // An empty message list is Ollama's way to preload a model.
     if messages.is_empty() {
@@ -169,7 +170,7 @@ pub async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatReques
         state.engine(&base).await?;
         return Ok(Json(json!({ "model": req.model, "created_at": now(), "message": { "role": "assistant", "content": "" }, "done": true, "done_reason": "load" })).into_response());
     }
-    let rx = state.generate(&req.model, Prompt::Chat(messages), sampling(&req.options)).await?;
+    let rx = state.generate_for(caller.as_deref(), &req.model, Prompt::Chat(messages), sampling(&req.options)).await?;
     let msg = |t: &str| json!({ "message": { "role": "assistant", "content": t } });
     if req.stream.unwrap_or(true) {
         return Ok(ndjson(rx, req.model, msg));
@@ -184,7 +185,7 @@ pub async fn chat(State(state): State<Arc<AppState>>, Json(req): Json<ChatReques
     Ok(Json(v).into_response())
 }
 
-pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<GenerateRequest>) -> Result<Response, ApiError> {
+pub async fn generate(State(state): State<Arc<AppState>>, caller: Option<Extension<Caller>>, Json(req): Json<GenerateRequest>) -> Result<Response, ApiError> {
     let prompt = if req.raw {
         Prompt::Text(req.prompt.clone())
     } else {
@@ -195,7 +196,7 @@ pub async fn generate(State(state): State<Arc<AppState>>, Json(req): Json<Genera
         msgs.push(ChatMessage::new("user", &req.prompt));
         Prompt::Chat(msgs)
     };
-    let rx = state.generate(&req.model, prompt, sampling(&req.options)).await?;
+    let rx = state.generate_for(caller.as_deref(), &req.model, prompt, sampling(&req.options)).await?;
     let resp = |t: &str| json!({ "response": t });
     if req.stream.unwrap_or(true) {
         return Ok(ndjson(rx, req.model, resp));

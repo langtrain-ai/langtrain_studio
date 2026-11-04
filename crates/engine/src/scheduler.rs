@@ -156,6 +156,7 @@ struct Seq {
     sampler: Sampler,
     out: TextStream,
     events: tokio::sync::mpsc::UnboundedSender<Event>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     usage: Usage,
     t_admit: Instant,
     t_first: Option<Instant>,
@@ -251,8 +252,10 @@ impl Engine {
     fn admit(&mut self) {
         let n_ctx = self.backend.n_ctx() as usize;
         while let Some((req, prompt, _)) = self.queue.front() {
-            if req.events.is_closed() {
-                self.queue.pop_front();
+            if req.is_cancelled() {
+                // Cancelled before it ran: nothing was computed, so usage is zero.
+                let (req, _, _) = self.queue.pop_front().expect("front exists");
+                let _ = req.events.send(Event::Done { reason: FinishReason::Cancelled, usage: Usage::default() });
                 continue;
             }
             let Some(place) = self.slots.place(prompt, req.adapter.as_deref()) else { break };
@@ -299,6 +302,7 @@ impl Engine {
                 out: TextStream::new(req.params.stop.clone()),
                 sampler: Sampler::new(req.params),
                 events: req.events,
+                cancel: req.cancel,
                 usage: Usage {
                     prompt_tokens: n_prompt,
                     cached_tokens: place.reuse,
@@ -354,7 +358,7 @@ impl Engine {
             return Ok(());
         }
         for s in &mut self.active {
-            if s.events.is_closed() {
+            if s.events.is_closed() || s.cancel.load(Ordering::Relaxed) {
                 s.finished = Some(FinishReason::Cancelled);
             }
         }
@@ -541,7 +545,7 @@ mod tests {
 
     fn run(handle: &EngineHandle, prompt: Prompt, params: SamplingParams, adapter: Option<&str>) -> (String, FinishReason, Usage) {
         let (tx, mut rx) = unbounded_channel();
-        handle.submit(GenerateRequest { prompt, params, adapter: adapter.map(Into::into), events: tx }).unwrap();
+        handle.submit(GenerateRequest::new(prompt, params, adapter.map(Into::into), tx)).unwrap();
         let mut text = String::new();
         loop {
             match rx.blocking_recv().expect("engine dropped request") {
@@ -638,10 +642,47 @@ mod tests {
     }
 
     #[test]
+    fn cancel_flag_stops_early_and_still_reports_usage() {
+        let h = engine(4096, 2, 64);
+        let (tx, mut rx) = unbounded_channel();
+        let req = GenerateRequest::new(chat("hi"), SamplingParams::greedy(), None, tx);
+        let cancel = req.cancel.clone();
+        h.submit(req).unwrap();
+        // Cancel after the first token. The mock may finish first; either way
+        // a final report with usage must arrive, which is what billing needs.
+        assert!(matches!(rx.blocking_recv(), Some(Event::Text(_))));
+        cancel.store(true, Ordering::Relaxed);
+        loop {
+            match rx.blocking_recv().expect("engine must report Done") {
+                Event::Done { reason, usage } => {
+                    assert!(matches!(reason, FinishReason::Cancelled | FinishReason::Stop));
+                    assert!(usage.prompt_tokens > 0 && usage.completion_tokens >= 1);
+                    break;
+                }
+                Event::Text(_) => {}
+                Event::Error(e) => panic!("{e}"),
+            }
+        }
+
+        // Cancelled before it was admitted: reported as cancelled with no usage.
+        let (tx, mut rx) = unbounded_channel();
+        let req = GenerateRequest::new(chat("hi"), SamplingParams::greedy(), None, tx);
+        req.cancel.store(true, Ordering::Relaxed);
+        h.submit(req).unwrap();
+        match rx.blocking_recv().expect("engine must report Done") {
+            Event::Done { reason, usage } => {
+                assert_eq!(reason, FinishReason::Cancelled);
+                assert_eq!(usage.completion_tokens, 0);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn rejects_prompt_larger_than_context() {
         let h = engine(64, 1, 16);
         let (tx, mut rx) = unbounded_channel();
-        h.submit(GenerateRequest { prompt: Prompt::Text("y".repeat(100)), params: SamplingParams::greedy(), adapter: None, events: tx })
+        h.submit(GenerateRequest::new(Prompt::Text("y".repeat(100)), SamplingParams::greedy(), None, tx))
             .unwrap();
         assert!(matches!(rx.blocking_recv(), Some(Event::Error(_))));
     }

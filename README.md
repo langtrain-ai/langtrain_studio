@@ -27,6 +27,37 @@ langtrain run SmolLM2-135M-Instruct-Q8_0@support-bot
 
 `train.jsonl` holds one example per line, as `{"messages": [...]}`, `{"prompt", "completion"}` or `{"text"}`.
 
+## Langtrain Cloud: sell your GPU, paid in advance
+
+`langtrain serve --cloud` turns the server into a paid API on your hardware. Every request needs an API key, and every request is paid for before it runs:
+
+1. Customers sign up in Studio (or `POST /v1/signup`) and get an API key, shown once and stored only as a hash.
+2. They buy a credit pack: Razorpay (UPI, cards) for rupees, Stripe for dollars. Credits are added only by a signed webhook for a checkout this server created, and each payment is applied once.
+3. Each request reserves its worst-case cost (prompt size plus `max_tokens`) from the balance, or is refused with `402 Payment Required`.
+4. When it ends, even if the client disconnects, the hold is released and the actual tokens are charged. Cached prompt tokens cost less.
+
+Setup:
+
+```bash
+export RAZORPAY_KEY_ID=... RAZORPAY_KEY_SECRET=... RAZORPAY_WEBHOOK_SECRET=...   # rupee payments
+export STRIPE_SECRET_KEY=... STRIPE_WEBHOOK_SECRET=...                           # dollar payments
+export LANGTRAIN_ADMIN_TOKEN=...                                                 # operator API
+langtrain serve --cloud --host 0.0.0.0
+```
+
+Point the providers' webhooks at `https://<your-domain>/v1/billing/webhooks/razorpay` (event `order.paid`) and `/v1/billing/webhooks/stripe` (event `checkout.session.completed`). Prices, packs, trial credit, token limits and the per-account concurrency limit live in `~/.langtrain/cloud.json`, written with defaults on first run; set `public_url` to your domain. Balances and history are in `~/.langtrain/billing.db` (SQLite), as an append-only ledger.
+
+Operator commands:
+
+```bash
+langtrain billing accounts
+langtrain billing create --email a@b.com --currency INR    # prints an API key
+langtrain billing new-key --email a@b.com                  # replace a lost key
+langtrain billing grant --email a@b.com --amount 500 --note "refund"
+```
+
+In cloud mode, fine-tuning jobs and `/v1/admin/*` need the admin token, and `/v1/system` hides hardware details. Run it behind HTTPS (a reverse proxy such as Caddy or nginx). Not yet included: email verification, GST invoices, auto-recharge and customer fine-tuning jobs (Phase 2 and 3 in the business plan).
+
 ## Layout
 
 | Path | What it is |
@@ -34,7 +65,7 @@ langtrain run SmolLM2-135M-Instruct-Q8_0@support-bot
 | `crates/engine` | Scheduler: continuous batching, chunked prefill, slot prefix cache with cross-slot KV copy, per-step multi-LoRA groups, sampling, stop strings. Backend-agnostic, with a mock backend for tests. |
 | `crates/native` | Langtrain's own engine: zero-copy GGUF reader, int8 kernels (NEON, AVX2, portable) for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and the K-quants Q4_K/Q5_K/Q6_K, paged f16 KV cache with copy-on-write, byte-level BPE tokenizer, Jinja chat templates, Llama/Mistral/Qwen2 forward pass, unmerged LoRA. |
 | `crates/engine/src/llama.rs` | llama.cpp backend (all GGUF quant types and architectures; Metal/CUDA/Vulkan builds; reloads on the CPU if the GPU cannot be used). |
-| `crates/server` | axum daemon: OpenAI + Ollama APIs, model store, fine-tuning job runner. |
+| `crates/server` | axum daemon: OpenAI + Ollama APIs, model store, fine-tuning job runner, and Langtrain Cloud billing (keys, prepaid ledger, metering, Razorpay/Stripe). |
 | `crates/web` | `langtrain-web`: the Studio UI, embedded with `include_str!`; no Node build step. |
 | `crates/cli` | `langtrain serve / run / list / pull / doctor / bench / tune`. |
 | `langtune/` | Python trainer: LoRA on the top K layers, frozen-prefix activation cache, GGUF adapter export. |
