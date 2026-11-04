@@ -262,7 +262,7 @@ async fn install_adapter(state: &AppState, job: &Job, path: &std::path::Path) ->
 
 pub async fn list(State(state): State<Arc<AppState>>) -> Json<Value> {
     let mut jobs: Vec<Job> = state.jobs.jobs.lock().await.values().cloned().collect();
-    jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    jobs.sort_by_key(|j| std::cmp::Reverse(j.created_at));
     Json(json!({ "object": "list", "data": jobs, "has_more": false }))
 }
 

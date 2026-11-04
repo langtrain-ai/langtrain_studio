@@ -32,8 +32,8 @@ langtrain run SmolLM2-135M-Instruct-Q8_0@support-bot
 | Path | What it is |
 |---|---|
 | `crates/engine` | Scheduler: continuous batching, chunked prefill, slot prefix cache with cross-slot KV copy, per-step multi-LoRA groups, sampling, stop strings. Backend-agnostic, with a mock backend for tests. |
-| `crates/native` | Langtrain's own engine: zero-copy GGUF reader, Q8_0/Q4_0 int8 kernels (NEON, AVX2, portable), paged f16 KV cache with copy-on-write, byte-level BPE tokenizer, Jinja chat templates, Llama/Mistral/Qwen2 forward pass, unmerged LoRA. |
-| `crates/engine/src/llama.rs` | llama.cpp backend (all GGUF quant types and architectures; Metal/CUDA/Vulkan builds). |
+| `crates/native` | Langtrain's own engine: zero-copy GGUF reader, int8 kernels (NEON, AVX2, portable) for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and the K-quants Q4_K/Q5_K/Q6_K, paged f16 KV cache with copy-on-write, byte-level BPE tokenizer, Jinja chat templates, Llama/Mistral/Qwen2 forward pass, unmerged LoRA. |
+| `crates/engine/src/llama.rs` | llama.cpp backend (all GGUF quant types and architectures; Metal/CUDA/Vulkan builds; reloads on the CPU if the GPU cannot be used). |
 | `crates/server` | axum daemon: OpenAI + Ollama APIs, model store, fine-tuning job runner. |
 | `crates/web` | `langtrain-web`: the Studio UI, embedded with `include_str!`; no Node build step. |
 | `crates/cli` | `langtrain serve / run / list / pull / doctor / bench / tune`. |
@@ -42,6 +42,8 @@ langtrain run SmolLM2-135M-Instruct-Q8_0@support-bot
 | `.github/workflows` | CI on Linux x64/arm64, macOS and Windows; tagged releases for 6 targets plus desktop bundles. |
 
 `--backend auto` (the default) uses the native engine when it supports the model file and llama.cpp otherwise. Force one with `--backend native` or `--backend llama`.
+
+Concurrency and context are tuned to the machine's RAM; override them with `--parallel <slots>` and `--ctx <tokens per slot>` (or `LANGTRAIN_PARALLEL` / `LANGTRAIN_CTX`).
 
 ## How CPU fine-tuning stays fast
 
@@ -53,22 +55,25 @@ langtrain run SmolLM2-135M-Instruct-Q8_0@support-bot
 
 ## Measured so far
 
-On an Apple M2 (8 cores, 16 GB), CPU only, with SmolLM2-135M-Instruct Q8_0:
+Apple M2 (4 performance + 4 efficiency cores, 16 GB), CPU only, SmolLM2-135M-Instruct, 4 threads (the auto-tuned default):
 
-| | Result |
-|---|---|
-| Native vs llama.cpp, greedy output | Identical over 120 tokens (code, quotes, emoji). Wording can diverge on long greedy runs because the KV cache precision differs (f16 vs q8_0). |
-| Native engine, 1 stream | ~100 tok/s decode, 53 ms time to first token |
-| Native engine, 4 concurrent streams | ~190 tok/s total |
-| Prefix cache on a shared system prompt | 93–97% of prompt tokens reused |
-| LangTune, 30 examples, 8 epochs, top 10/30 layers | 43 s end to end on CPU; loss 2.29 → 0.004; adapter answers correctly on both engines |
+| | Native engine | llama.cpp |
+|---|---|---|
+| Greedy output vs llama.cpp, Q8_0 | Identical over 120 tokens (code, quotes, emoji) | reference |
+| Greedy output vs llama.cpp, Q4_K_M | Coherent; diverges after a few tokens (activation block size differs at near-tied logits) | reference |
+| Dequantization vs gguf-py reference, Q4_K_M | All 211 tensors match (Q4_K, Q6_K, Q5_0, Q8_0) | |
+| Q4_K_M, 1 stream | ~132 tok/s per stream | ~320 tok/s |
+| Q4_K_M, 4 concurrent streams | ~188 tok/s total | ~409 tok/s total |
+| Prefix cache on a shared system prompt | 93–96% of prompt tokens reused | same scheduler |
 
-llama.cpp measured much slower than the native engine in this test environment, which is not typical for llama.cpp on an M2. Treat that comparison as unresolved until it is re-run outside a sandbox.
+LangTune: 30 examples, 8 epochs, top 10/30 layers took 43 s end to end on the CPU (loss 2.29 → 0.004), and the adapter answered correctly on both engines.
+
+Threads matter: on hybrid CPUs, using the efficiency cores too made both engines slower, so the profile uses performance cores only. The native engine is currently about 2x slower than llama.cpp; the gap is in the matmul and attention loops, not in batching or caching.
 
 ## Native engine roadmap
 
-- K-quants (Q4_K, Q5_K, Q6_K), the most common GGUF downloads; until then these models fall back to llama.cpp
+- Close the speed gap with llama.cpp: tiled multi-row matmul (i8mm `smmla`), a lighter attention loop, int8 KV cache
+- AVX-512/AMX and SVE kernels
 - SentencePiece tokenizers (Llama 2, Mistral v0.1) and more architectures (Gemma, Phi, Qwen3)
-- Tiled multi-head attention and int8 KV cache; AVX-512/AMX and SVE kernels
 - Speculative decoding, constrained JSON output, KV cache saved to disk
 - A Metal compute path

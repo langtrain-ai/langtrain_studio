@@ -59,7 +59,13 @@ pub enum DType {
     F32,
     F16,
     Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
     Q8_0,
+    Q4K,
+    Q5K,
+    Q6K,
     Other(u32),
 }
 
@@ -69,7 +75,13 @@ impl DType {
             0 => DType::F32,
             1 => DType::F16,
             2 => DType::Q4_0,
+            3 => DType::Q4_1,
+            6 => DType::Q5_0,
+            7 => DType::Q5_1,
             8 => DType::Q8_0,
+            12 => DType::Q4K,
+            13 => DType::Q5K,
+            14 => DType::Q6K,
             o => DType::Other(o),
         }
     }
@@ -80,7 +92,13 @@ impl DType {
             DType::F32 => n * 4,
             DType::F16 => n * 2,
             DType::Q4_0 => n / 32 * 18,
+            DType::Q4_1 => n / 32 * 20,
+            DType::Q5_0 => n / 32 * 22,
+            DType::Q5_1 => n / 32 * 24,
             DType::Q8_0 => n / 32 * 34,
+            DType::Q4K => n / 256 * 144,
+            DType::Q5K => n / 256 * 176,
+            DType::Q6K => n / 256 * 210,
             DType::Other(_) => return None,
         })
     }

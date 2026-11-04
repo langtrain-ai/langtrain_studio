@@ -99,6 +99,7 @@ impl Lora {
     }
 
     /// `y[t] += scale * B (A x[t])` for `n` rows.
+    #[allow(clippy::too_many_arguments)]
     fn apply(&self, layer: usize, p: Proj, x: &[f32], n: usize, in_dim: usize, y: &mut [f32], out_dim: usize) {
         let Some(lp) = self.pairs.get(&(layer, p)) else { return };
         for t in 0..n {
@@ -232,9 +233,28 @@ impl Model {
     }
 
     fn proj(&self, layer: usize, p: Proj, x: &[f32], xq: &QActs, out: &mut [f32], lora: Option<&Lora>) {
+        self.layers[layer].w[&p].matmul(xq, out);
+        self.finish_proj(layer, p, x, xq, out, lora);
+    }
+
+    /// Several projections of the same input in one parallel region, so
+    /// threads that finish one matrix move on to the next without a barrier.
+    fn proj_many(&self, layer: usize, x: &[f32], xq: &QActs, outs: &mut [(Proj, &mut [f32])], lora: Option<&Lora>) {
+        let w = &self.layers[layer].w;
+        rayon::scope(|s| {
+            for (p, out) in outs.iter_mut() {
+                let m = &w[p];
+                s.spawn(move |_| m.matmul(xq, out));
+            }
+        });
+        for (p, out) in outs.iter_mut() {
+            self.finish_proj(layer, *p, x, xq, out, lora);
+        }
+    }
+
+    fn finish_proj(&self, layer: usize, p: Proj, x: &[f32], xq: &QActs, out: &mut [f32], lora: Option<&Lora>) {
         let l = &self.layers[layer];
         let w = &l.w[&p];
-        w.matmul(xq, out);
         if let Some(b) = l.bias.get(&p) {
             for row in out.chunks_exact_mut(w.rows) {
                 for (o, bv) in row.iter_mut().zip(b) {
@@ -288,9 +308,7 @@ impl Model {
         for (li, layer) in self.layers.iter().enumerate() {
             rms_norm(&x, &layer.attn_norm, c.eps, &mut h);
             xq.quantize(&h, n, dim);
-            self.proj(li, Proj::Q, &h, &xq, &mut q, lora);
-            self.proj(li, Proj::K, &h, &xq, &mut k, lora);
-            self.proj(li, Proj::V, &h, &xq, &mut v, lora);
+            self.proj_many(li, &h, &xq, &mut [(Proj::Q, &mut q), (Proj::K, &mut k), (Proj::V, &mut v)], lora);
             for i in 0..n {
                 self.rope(&mut q[i * q_dim..(i + 1) * q_dim], c.n_heads, positions[i]);
                 self.rope(&mut k[i * kv_dim..(i + 1) * kv_dim], c.n_kv_heads, positions[i]);
@@ -335,8 +353,7 @@ impl Model {
 
             rms_norm(&x, &layer.ffn_norm, c.eps, &mut h);
             xq.quantize(&h, n, dim);
-            self.proj(li, Proj::Gate, &h, &xq, &mut gate, lora);
-            self.proj(li, Proj::Up, &h, &xq, &mut up, lora);
+            self.proj_many(li, &h, &xq, &mut [(Proj::Gate, &mut gate), (Proj::Up, &mut up)], lora);
             for (g, u) in gate.iter_mut().zip(&up) {
                 *g = *g / (1.0 + (-*g).exp()) * u; // SiLU(g) * u
             }
@@ -369,26 +386,7 @@ impl Model {
         if t >= self.embed.rows {
             bail!("token id {t} out of range");
         }
-        // Dequantize one row of the embedding table.
-        let cols = self.embed.cols;
-        let nb = cols / crate::quant::QK;
-        let scales = &self.embed.scales[t * nb..(t + 1) * nb];
-        match &self.embed.w {
-            crate::quant::Weights::Q8 { qs } => {
-                for (j, o) in out.iter_mut().enumerate() {
-                    *o = scales[j / 32] * qs[t * cols + j] as f32;
-                }
-            }
-            crate::quant::Weights::Q4 { qs } => {
-                let row = &qs[t * cols / 2..(t + 1) * cols / 2];
-                for b in 0..nb {
-                    for j in 0..16 {
-                        out[b * 32 + j] = scales[b] * ((row[b * 16 + j] & 0x0f) as i32 - 8) as f32;
-                        out[b * 32 + j + 16] = scales[b] * ((row[b * 16 + j] >> 4) as i32 - 8) as f32;
-                    }
-                }
-            }
-        }
+        self.embed.dequant_row(t, out);
         Ok(())
     }
 }

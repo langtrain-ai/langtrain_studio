@@ -89,7 +89,7 @@ impl Tokenizer {
                 }
             }
         }
-        specials.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        specials.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
 
         let pre_type = g.str("tokenizer.ggml.pre").unwrap_or("default");
         let pre = match pre_type {

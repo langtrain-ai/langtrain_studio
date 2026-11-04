@@ -9,6 +9,9 @@
 //! It plugs into the scheduler through [`langtrain_engine::Backend`], so
 //! batching, prefix caching and adapter scheduling are shared with llama.cpp.
 
+// GGUF blocks are byte runs; `chunks_exact(34)` reads clearer than `as_chunks::<34>()`.
+#![allow(clippy::chunks_exact_to_as_chunks)]
+
 pub mod gguf;
 pub mod kv;
 pub mod model;

@@ -9,6 +9,8 @@ pub struct Hardware {
     pub arch: String,
     pub cpu_brand: String,
     pub physical_cores: usize,
+    /// Performance cores on hybrid CPUs (Apple Silicon), when the OS reports them.
+    pub performance_cores: Option<usize>,
     pub logical_cores: usize,
     pub total_memory_gb: f64,
     pub available_memory_gb: f64,
@@ -58,6 +60,7 @@ pub fn detect() -> Hardware {
             .and_then(|s| s.cpus().first().map(|c| c.brand().trim().to_string()))
             .unwrap_or_default(),
         physical_cores: System::physical_core_count().unwrap_or(logical).max(1),
+        performance_cores: performance_cores(),
         logical_cores: logical,
         total_memory_gb: total as f64 / GB,
         available_memory_gb: available as f64 / GB,
@@ -67,6 +70,23 @@ pub fn detect() -> Hardware {
         os,
         arch,
     }
+}
+
+/// P-core count on Apple Silicon. Matmul threads that land on efficiency
+/// cores make every synchronized step wait for the slowest core.
+#[cfg(target_os = "macos")]
+fn performance_cores() -> Option<usize> {
+    let mut n: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    let name = c"hw.perflevel0.physicalcpu";
+    // SAFETY: valid NUL-terminated name and correctly sized output buffer.
+    let rc = unsafe { libc::sysctlbyname(name.as_ptr(), (&mut n as *mut libc::c_int).cast(), &mut size, std::ptr::null_mut(), 0) };
+    (rc == 0 && n > 0).then_some(n as usize)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn performance_cores() -> Option<usize> {
+    None
 }
 
 #[allow(clippy::vec_init_then_push)]
@@ -108,8 +128,9 @@ impl Hardware {
 
     /// Pick runtime settings for this machine.
     pub fn profile(&self) -> Profile {
-        // Matmul-bound decode scales with physical cores; SMT siblings only add contention.
-        let threads = self.physical_cores;
+        // Matmul-bound decode scales with fast physical cores; SMT siblings and
+        // efficiency cores only add synchronization stalls.
+        let threads = self.performance_cores.unwrap_or(self.physical_cores);
         let mem = self.total_memory_gb;
         // Leave room for the OS, the KV cache and the user's other apps.
         let budget = if self.apple_silicon { mem * 0.70 } else { mem * 0.60 };
@@ -145,7 +166,7 @@ impl Hardware {
 
         Profile {
             threads,
-            threads_batch: self.logical_cores.max(threads),
+            threads_batch: threads,
             parallel_slots,
             context_per_slot: 4096,
             // q8_0 halves KV memory with negligible quality loss.

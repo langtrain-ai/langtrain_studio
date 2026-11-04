@@ -26,6 +26,15 @@ struct Cli {
     /// Inference engine: `auto` (native when supported), `native`, or `llama`.
     #[arg(long, env = "LANGTRAIN_BACKEND", global = true, default_value = "auto")]
     backend: BackendChoice,
+    /// Concurrent sequences (KV slots); defaults to a value tuned to this machine's RAM.
+    #[arg(long, env = "LANGTRAIN_PARALLEL", global = true)]
+    parallel: Option<u32>,
+    /// Context length per slot, in tokens.
+    #[arg(long, env = "LANGTRAIN_CTX", global = true)]
+    ctx: Option<u32>,
+    /// Compute threads (default: physical cores).
+    #[arg(long, env = "LANGTRAIN_THREADS", global = true)]
+    threads: Option<usize>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -112,7 +121,19 @@ fn langtune_dir() -> Option<PathBuf> {
 fn config(home: PathBuf, mock: bool) -> ServerConfig {
     let backend = BACKEND.get().copied().unwrap_or(BackendChoice::Auto);
     let hw = hardware::detect();
-    let profile = hw.profile();
+    let mut profile = hw.profile();
+    if let Some(&(parallel, ctx, threads)) = OVERRIDES.get() {
+        if let Some(t) = threads {
+            profile.threads = t.max(1);
+            profile.threads_batch = t.max(1);
+        }
+        if let Some(p) = parallel {
+            profile.parallel_slots = p.max(1);
+        }
+        if let Some(c) = ctx {
+            profile.context_per_slot = c.max(256);
+        }
+    }
     ServerConfig {
         home,
         enable_mock: mock,
@@ -125,6 +146,7 @@ fn config(home: PathBuf, mock: bool) -> ServerConfig {
 }
 
 static BACKEND: std::sync::OnceLock<BackendChoice> = std::sync::OnceLock::new();
+static OVERRIDES: std::sync::OnceLock<(Option<u32>, Option<u32>, Option<usize>)> = std::sync::OnceLock::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -135,6 +157,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let home = home_dir(cli.home);
     let _ = BACKEND.set(cli.backend);
+    let _ = OVERRIDES.set((cli.parallel, cli.ctx, cli.threads));
     match cli.cmd {
         Cmd::Serve { host, port, mock } => {
             let addr: SocketAddr = format!("{host}:{port}").parse().context("invalid host/port")?;

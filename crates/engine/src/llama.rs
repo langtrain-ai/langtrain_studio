@@ -57,7 +57,19 @@ pub struct LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
+    /// Load on the configured devices; if the GPU cannot be used (no driver,
+    /// out of memory, sandboxed), retry on the CPU instead of failing.
     pub fn load(opts: &LlamaOptions) -> Result<Self> {
+        match Self::load_on(opts) {
+            Err(e) if opts.gpu_layers > 0 => {
+                tracing::warn!("GPU load failed ({e:#}); falling back to CPU");
+                Self::load_on(&LlamaOptions { gpu_layers: 0, ..opts.clone() })
+            }
+            r => r,
+        }
+    }
+
+    fn load_on(opts: &LlamaOptions) -> Result<Self> {
         let backend = global_backend()?;
         let mut params = LlamaModelParams::default().with_n_gpu_layers(opts.gpu_layers);
         if opts.gpu_layers == 0 {
