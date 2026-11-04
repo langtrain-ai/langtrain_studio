@@ -12,12 +12,17 @@ use axum::Router;
 struct Asset {
     path: &'static str,
     mime: &'static str,
-    body: &'static str,
+    body: &'static [u8],
+    /// Fonts never change for a given file name, so browsers may keep them.
+    immutable: bool,
 }
 
 macro_rules! asset {
     ($path:literal, $mime:literal) => {
-        Asset { path: $path, mime: $mime, body: include_str!(concat!("../assets/", $path)) }
+        Asset { path: $path, mime: $mime, body: include_bytes!(concat!("../assets/", $path)), immutable: false }
+    };
+    ($path:literal, $mime:literal, immutable) => {
+        Asset { path: $path, mime: $mime, body: include_bytes!(concat!("../assets/", $path)), immutable: true }
     };
 }
 
@@ -26,13 +31,20 @@ const ASSETS: &[Asset] = &[
     asset!("app.css", "text/css; charset=utf-8"),
     asset!("app.js", "text/javascript; charset=utf-8"),
     asset!("icon.svg", "image/svg+xml"),
+    // The Langtrain brand files, unmodified (langtrain_brand/logo).
+    asset!("logo-white.svg", "image/svg+xml"),
+    asset!("logo-black.svg", "image/svg+xml"),
+    asset!("check.svg", "image/svg+xml"),
+    // Brand fonts ship inside the binary so Studio looks right offline.
+    asset!("fonts/hanken-grotesk.woff2", "font/woff2", immutable),
+    asset!("fonts/jetbrains-mono.woff2", "font/woff2", immutable),
 ];
 
 /// Content hash used as the ETag, so browsers revalidate cheaply after upgrades.
-fn etag(body: &str) -> String {
+fn etag(body: &[u8]) -> String {
     // FNV-1a: stable across builds and platforms.
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in body.bytes() {
+    for &b in body {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
     format!("\"{h:016x}\"")
@@ -49,7 +61,10 @@ fn serve(path: &str, headers: &HeaderMap) -> Response {
     (
         [
             (header::CONTENT_TYPE, HeaderValue::from_static(asset.mime)),
-            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(if asset.immutable { "public, max-age=31536000, immutable" } else { "no-cache" }),
+            ),
             (header::ETAG, HeaderValue::from_str(&tag).expect("ascii")),
         ],
         asset.body,
@@ -62,7 +77,7 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/", get(|h: HeaderMap| async move { serve("index.html", &h) }))
         .route(
-            "/assets/{file}",
+            "/assets/{*file}",
             get(|axum::extract::Path(file): axum::extract::Path<String>, h: HeaderMap| async move { serve(&file, &h) }),
         )
 }
@@ -88,7 +103,7 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
 
-        for f in ["app.js", "app.css", "icon.svg"] {
+        for f in ["app.js", "app.css", "icon.svg", "logo-white.svg", "logo-black.svg", "check.svg", "fonts/hanken-grotesk.woff2", "fonts/jetbrains-mono.woff2"] {
             let res = app.clone().oneshot(Request::get(format!("/assets/{f}")).body(Body::empty()).unwrap()).await.unwrap();
             assert_eq!(res.status(), StatusCode::OK, "{f}");
         }

@@ -6,3 +6,4 @@ __pycache__/
 .venv/
 studio/src-tauri/binaries/
 studio/src-tauri/gen/
+**/.cc-writes

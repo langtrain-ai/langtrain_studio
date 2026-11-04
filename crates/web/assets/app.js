@@ -44,9 +44,17 @@ document.querySelectorAll(".nav").forEach((b) =>
 function show(name) {
   document.querySelectorAll(".nav").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
   document.querySelectorAll(".view").forEach((v) => v.classList.toggle("active", v.id === "view-" + name));
+  // Each view has its own address, so back/forward and shared links work.
+  if (location.hash !== "#" + name) history.pushState(null, "", "#" + name);
   if (views[name]) views[name]();
   try { localStorage.setItem("lt.view", name); } catch {}
 }
+
+window.addEventListener("hashchange", () => {
+  const name = location.hash.replace("#", "");
+  const tab = document.querySelector(`[data-view="${name}"]`);
+  if (name in views && tab && !tab.hidden) show(name);
+});
 
 // ---------- shared model list ----------
 let modelIds = [];
@@ -62,13 +70,14 @@ async function refreshModelIds() {
 function safeGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
 
 // ---------- chat ----------
-let history = [];
+// Messages of the current chat (not to be confused with window.history).
+let conversation = [];
 let controller = null;
 
 $("#chat-model").addEventListener("change", (e) => { try { localStorage.setItem("lt.model", e.target.value); } catch {} });
 $("#chat-clear").addEventListener("click", () => {
-  history = [];
-  $("#messages").replaceChildren(el("div", "empty", "New chat."));
+  conversation = [];
+  $("#messages").replaceChildren(emptyChat());
   $("#chat-stats").textContent = "";
 });
 $("#prompt").addEventListener("keydown", (e) => {
@@ -83,10 +92,24 @@ $("#composer").addEventListener("submit", async (e) => {
   $("#prompt").value = "";
   $("#messages").querySelector(".empty")?.remove();
   addMsg("user", text);
-  history.push({ role: "user", content: text });
+  conversation.push({ role: "user", content: text });
   const out = addMsg("assistant", "");
   await streamChat(model, out);
 });
+
+function emptyChat() {
+  const e = el("div", "empty");
+  e.append(el("div", "eyebrow", "New chat"), el("p", "empty-title", "Ask anything."), el("p", "empty-body", "Your conversation stays on this server."));
+  return e;
+}
+
+function emptyRow(cols, text) {
+  const tr = el("tr", "table-empty");
+  const td = el("td", "", text);
+  td.colSpan = cols;
+  tr.append(td);
+  return tr;
+}
 
 function addMsg(role, text) {
   const m = el("div", "msg " + role, text);
@@ -97,7 +120,7 @@ function addMsg(role, text) {
 
 async function streamChat(model, out) {
   const system = $("#chat-system").value.trim();
-  const messages = system ? [{ role: "system", content: system }, ...history] : history;
+  const messages = system ? [{ role: "system", content: system }, ...conversation] : conversation;
   controller = new AbortController();
   $("#send").textContent = "Stop";
   const t0 = performance.now();
@@ -141,7 +164,7 @@ async function streamChat(model, out) {
         }
       }
     }
-    history.push({ role: "assistant", content: reply });
+    conversation.push({ role: "assistant", content: reply });
     const secs = (performance.now() - (first || t0)) / 1000;
     if (usage) {
       $("#chat-stats").textContent =
@@ -151,11 +174,11 @@ async function streamChat(model, out) {
     }
   } catch (err) {
     if (err.name === "AbortError") {
-      history.push({ role: "assistant", content: reply });
+      conversation.push({ role: "assistant", content: reply });
     } else {
       out.classList.add("error");
       out.textContent = reply ? reply + "\n\n" + err.message : err.message;
-      history.pop();
+      conversation.pop();
     }
   } finally {
     controller = null;
@@ -175,15 +198,15 @@ async function loadModels() {
     tr.append(el("td", "", m.name), el("td", "", m.size_bytes ? gb(m.size_bytes) : "-"));
     const ad = el("td");
     if (!m.adapters.length) ad.textContent = "-";
-    m.adapters.forEach((a) => ad.append(el("span", "pill", a)));
+    m.adapters.forEach((a) => ad.append(el("span", "chip mint", a)));
     const act = el("td");
-    const b = el("button", "small ghost", "Chat");
+    const b = el("button", "btn ghost small", "Chat");
     b.onclick = async () => { await refreshModelIds(); $("#chat-model").value = m.name; show("chat"); };
     act.append(b);
     tr.append(ad, act);
     body.append(tr);
   }
-  if (!sys.models.length) body.append(Object.assign(el("tr"), { innerHTML: '<td colspan="4" class="muted">No models yet.</td>' }));
+  if (!sys.models.length) body.append(emptyRow(4, "No models yet. Pull one with the command above."));
 }
 
 // ---------- fine-tuning ----------
@@ -241,7 +264,8 @@ function renderJob(j) {
   const head = el("div", "job-head");
   const title = el("div");
   title.append(el("strong", "", j.suffix), el("span", "muted", `  on ${j.model}`));
-  head.append(title, el("span", "status " + j.status, j.status));
+  const tone = { succeeded: "mint", failed: "rose", cancelled: "rose", running: "sky", queued: "amber" }[j.status] || "";
+  head.append(title, el("span", "chip " + tone, j.status));
   card.append(head);
 
   const p = j.progress || {};
@@ -259,14 +283,14 @@ function renderJob(j) {
     if (p.tokens_per_sec) parts.push(`${p.tokens_per_sec.toFixed(0)} tok/s`);
     if (p.eta_seconds !== undefined) parts.push(`ETA ${fmtSecs(p.eta_seconds)}`);
     card.append(el("div", "job-meta", parts.join(" · ") || "starting…"));
-    const c = el("button", "small ghost", "Cancel");
+    const c = el("button", "btn ghost small", "Cancel");
     c.onclick = () => api(`/v1/fine_tuning/jobs/${j.id}/cancel`, { method: "POST" }).then(loadJobs);
     head.append(c);
   }
   if (j.status === "succeeded" && j.fine_tuned_model) {
     const meta = el("div", "job-meta");
     meta.append(`Ready as `, el("code", "", j.fine_tuned_model), "  ");
-    const b = el("button", "small", "Chat with it");
+    const b = el("button", "btn primary small", "Chat with it");
     b.onclick = async () => { await refreshModelIds(); $("#chat-model").value = j.fine_tuned_model; show("chat"); };
     meta.append(b);
     card.append(meta);
@@ -285,7 +309,7 @@ async function loadSystem() {
   const hw = s.hardware, pr = s.profile;
   fill($("#hw"), [
     ["CPU", hw.cpu_brand || hw.arch],
-    ["Cores", `${hw.physical_cores} physical / ${hw.logical_cores} logical`],
+    ["Cores", `${hw.physical_cores} physical / ${hw.logical_cores} logical` + (hw.performance_cores ? `, ${hw.performance_cores} performance` : "")],
     ["Memory", `${hw.total_memory_gb.toFixed(1)} GB total, ${hw.available_memory_gb.toFixed(1)} GB free`],
     ["CPU features", hw.cpu_features.join(", ") || "-"],
     ["GPU backends", hw.gpu_backends.join(", ") || "none (CPU build)"],
@@ -322,9 +346,22 @@ async function loadLoaded() {
   }
   try {
     const s = await api("/v1/system");
-    $("#loaded-model").textContent = s.loaded ? `Loaded: ${s.loaded.model}\n${s.loaded.info.backend}` : "No model loaded";
+    const chip = $("#loaded-model");
+    chip.textContent = s.loaded ? s.loaded.model : "No model loaded";
+    chip.title = s.loaded ? `Running on ${s.loaded.info.backend}` : "";
   } catch {}
 }
+
+// ---------- segmented toggles ----------
+document.querySelectorAll(".segmented[data-toggle]").forEach((group) => {
+  const input = document.getElementById(group.dataset.toggle);
+  group.querySelectorAll("button").forEach((b) => {
+    b.addEventListener("click", () => {
+      group.querySelectorAll("button").forEach((o) => o.setAttribute("aria-checked", String(o === b)));
+      if (input) input.value = b.dataset.value;
+    });
+  });
+});
 
 // ---------- boot ----------
 // ---------- billing (Langtrain Cloud) ----------
@@ -479,24 +516,40 @@ async function loadBilling() {
   $("#bill-held").textContent = acct.held > 0 ? `${money(acct.held, cur)} reserved by requests that are running` : "";
   $("#bill-who").textContent = acct.account.email;
   const p = acct.prices;
-  $("#bill-prices").textContent =
-    `Per million tokens: ${cur === "USD" ? "$" : "₹"}${p.input_per_m} input, ${cur === "USD" ? "$" : "₹"}${p.cached_input_per_m} cached input, ${cur === "USD" ? "$" : "₹"}${p.output_per_m} output. ` +
-    `Each request reserves its largest possible cost before it runs and is charged only for what it used.`;
+  const sym = cur === "USD" ? "$" : "₹";
+  $("#bill-prices").replaceChildren(
+    ...[["Input tokens", p.input_per_m], ["Cached input tokens", p.cached_input_per_m], ["Output tokens", p.output_per_m]].map(([label, v]) => {
+      const tr = el("tr");
+      tr.append(el("td", "", label), el("td", "dim num", sym + v));
+      return tr;
+    })
+  );
 
   const packs = (billingConfig?.packs || []).filter((x) => x.currency === cur);
   const box = $("#bill-packs");
   box.replaceChildren();
   const providers = billingConfig?.providers || {};
   const canPay = providers.razorpay || providers.stripe;
-  for (const pk of packs) {
-    const b = el("button", "pack");
+  const tiers = ["Small", "Medium", "Large", "Extra large"];
+  const fmt = (v) => sym + v.toLocaleString(cur === "USD" ? "en-US" : "en-IN");
+  packs.forEach((pk, i) => {
+    const card = el("div", "pack-card");
+    const credit = pk.amount + (pk.amount * pk.bonus_pct) / 100;
+    const price = el("div", "price");
+    price.append(el("strong", "", fmt(pk.amount)));
+    const b = el("button", "btn ghost", "Buy credits");
     b.type = "button";
     b.disabled = !canPay;
-    b.append(el("span", "amt", (cur === "USD" ? "$" : "₹") + pk.amount.toLocaleString(cur === "USD" ? "en-US" : "en-IN")));
-    if (pk.bonus_pct) b.append(el("span", "bonus", `+${pk.bonus_pct}% bonus`));
     b.onclick = () => buy(pk);
-    box.append(b);
-  }
+    card.append(
+      el("div", "eyebrow-tier", tiers[i] || "Pack"),
+      el("div", "credit", `${fmt(credit)} credit`),
+      price,
+      el("div", "note", pk.bonus_pct ? `Includes a ${pk.bonus_pct}% bonus` : "Pay as you go"),
+      b
+    );
+    box.append(card);
+  });
   $("#bill-pay-note").textContent = canPay
     ? cur === "INR" ? "Pay with UPI, cards or netbanking. GST invoice by email." : "Pay by card. Receipt by email."
     : "Online payment is not set up on this server yet. Contact the operator to add credit.";
@@ -509,12 +562,14 @@ async function loadBilling() {
   const kb = $("#bill-keys");
   kb.replaceChildren(...keys.data.filter((k) => !k.revoked).map((k) => {
     const tr = el("tr");
-    tr.append(el("td", "", k.name), el("td", "", k.prefix + "…"), el("td", "", when(k.created_at)), el("td", "", when(k.last_used_at)));
+    const keyCell = el("td");
+    keyCell.append(el("code", "", k.prefix + "…"));
+    tr.append(el("td", "", k.name), keyCell, el("td", "dim", when(k.created_at)), el("td", "dim", when(k.last_used_at)));
     const td = el("td");
     if (k.id === keys.current) {
-      td.append(el("span", "pill", "this browser"));
+      td.append(el("span", "chip mint", "this browser"));
     } else {
-      const r = el("button", "small ghost", "Revoke");
+      const r = el("button", "btn ghost small danger", "Revoke");
       r.onclick = async () => {
         if (r.dataset.confirm !== "1") { r.dataset.confirm = "1"; r.textContent = "Click again to revoke"; return; }
         await api(`/v1/keys/${k.id}`, { method: "DELETE" }).catch((err) => toast(err.message));
@@ -529,17 +584,18 @@ async function loadBilling() {
   ub.replaceChildren(...usage.data.slice(0, 50).map((u) => {
     const tr = el("tr");
     const prompt = u.cached_tokens ? `${u.prompt_tokens} (${u.cached_tokens} cached)` : String(u.prompt_tokens);
-    tr.append(el("td", "", when(u.created_at)), el("td", "", u.model), el("td", "", prompt), el("td", "", String(u.completion_tokens)), el("td", "amount-neg", money(u.cost, cur)));
+    tr.append(el("td", "dim", when(u.created_at)), el("td", "", u.model), el("td", "num", prompt), el("td", "num", String(u.completion_tokens)), el("td", "amount-neg", money(u.cost, cur)));
     return tr;
   }));
-  if (!usage.data.length) ub.append(Object.assign(el("tr"), { innerHTML: '<td colspan="5" class="muted">No requests yet.</td>' }));
+  if (!usage.data.length) ub.append(emptyRow(5, "No requests yet. Your API calls will show up here."));
   const lb = $("#bill-ledger");
   lb.replaceChildren(...ledger.data.map((e) => {
     const tr = el("tr");
     const label = KIND_LABEL[e.kind] || e.kind;
-    tr.append(el("td", "", when(e.created_at)), el("td", "", e.note ? `${label} · ${e.note}` : label), el("td", e.amount > 0 ? "amount-pos" : "amount-neg", (e.amount > 0 ? "+" : "") + money(e.amount, cur)));
+    tr.append(el("td", "dim", when(e.created_at)), el("td", "", e.note ? `${label} · ${e.note}` : label), el("td", e.amount > 0 ? "amount-pos" : "amount-neg", (e.amount > 0 ? "+" : "") + money(e.amount, cur)));
     return tr;
   }));
+  if (!ledger.data.length) lb.append(emptyRow(3, "No credit yet. Buy a pack above to get started."));
 }
 
 // ---------- boot ----------
