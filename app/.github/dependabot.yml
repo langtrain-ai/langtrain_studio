@@ -1,0 +1,56 @@
+# Dependabot: monthly version updates in one PR per ecosystem, no major
+# versions except for GitHub Actions (majors need a tested upgrade), and
+# security fixes grouped into one PR per ecosystem. Security updates may
+# still propose a major version when it is the only fix.
+version: 2
+updates:
+- package-ecosystem: github-actions
+  directory: /
+  schedule:
+    interval: monthly
+  groups:
+    github-actions:
+      applies-to: version-updates
+      patterns:
+      - '*'
+    github-actions-security:
+      applies-to: security-updates
+      patterns:
+      - '*'
+  open-pull-requests-limit: 2
+- package-ecosystem: npm
+  directory: /
+  schedule:
+    interval: monthly
+  groups:
+    npm:
+      applies-to: version-updates
+      patterns:
+      - '*'
+    npm-security:
+      applies-to: security-updates
+      patterns:
+      - '*'
+  open-pull-requests-limit: 2
+  ignore:
+  - dependency-name: '*'
+    update-types:
+    - version-update:semver-major
+- package-ecosystem: cargo
+  directory: /src-tauri
+  schedule:
+    interval: monthly
+  groups:
+    cargo:
+      applies-to: version-updates
+      patterns:
+      - '*'
+    cargo-security:
+      applies-to: security-updates
+      patterns:
+      - '*'
+  open-pull-requests-limit: 2
+  ignore:
+  - dependency-name: '*'
+    update-types:
+    - version-update:semver-major

@@ -1,0 +1,33 @@
+[package]
+name = "langtrain-studio-desktop"
+version = "0.1.0"
+description = "Langtrain Studio — Local AI model inference, fine-tuning, and agent execution"
+authors = ["Langtrain"]
+edition = "2021"
+
+[lib]
+name = "langtrain_studio_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hardware detection
+sysinfo = "0.39"
+dirs = "7"
+
+# Async runtime + HTTP for model downloads
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", features = ["json", "stream", "blocking", "query"] }
+futures-util = "0.3"
+
+# Unix-specific for disk space detection
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
