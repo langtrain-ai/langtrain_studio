@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Langtrain Studio</title>
+  <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+  <link rel="preload" href="/assets/fonts/hanken-grotesk.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <nav class="navpill" aria-label="Studio">
+      <a class="logo" href="#chat" aria-label="Langtrain Studio">
+        <img class="logo-lockup on-dark" src="/assets/logo-white.svg" alt="Langtrain">
+        <img class="logo-lockup on-light" src="/assets/logo-black.svg" alt="Langtrain">
+        <img class="logo-icon" src="/assets/icon.svg" alt="Langtrain">
+        <span class="logo-sub">Studio</span>
+      </a>
+      <div class="tabs">
+        <button class="nav active" data-view="chat">Chat</button>
+        <button class="nav" data-view="models">Models</button>
+        <button class="nav" data-view="tune">Fine-tune</button>
+        <button class="nav" data-view="system">System</button>
+        <button class="nav" data-view="billing" hidden>Billing</button>
+      </div>
+      <div class="status-chip" id="loaded-model">No model loaded</div>
+    </nav>
+  </header>
+
+  <main class="shell">
+    <!-- Chat -->
+    <section class="view active" id="view-chat">
+      <div class="chat-tools">
+        <label class="field-inline">
+          <span class="eyebrow-label">Model</span>
+          <select id="chat-model" aria-label="Model"></select>
+        </label>
+        <label class="field-inline">
+          <span class="eyebrow-label">Temperature</span>
+          <input id="chat-temp" type="number" min="0" max="2" step="0.1" value="0.7">
+        </label>
+        <button class="btn ghost" id="chat-clear">New chat</button>
+      </div>
+      <details class="system-prompt">
+        <summary>System prompt</summary>
+        <textarea id="chat-system" rows="3" placeholder="You are a helpful assistant."></textarea>
+      </details>
+      <div class="messages" id="messages">
+        <div class="empty">
+          <div class="eyebrow">Langtrain Studio</div>
+          <p class="empty-title">Pick a model and say hello.</p>
+          <p class="empty-body">Fine-tuned adapters show up in the list as <code>model@adapter</code>.</p>
+        </div>
+      </div>
+      <form class="composer" id="composer">
+        <textarea id="prompt" rows="2" placeholder="Message (Enter to send, Shift+Enter for a new line)"></textarea>
+        <button type="submit" class="btn primary" id="send">Send</button>
+      </form>
+      <div class="stats" id="chat-stats"></div>
+    </section>
+
+    <!-- Models -->
+    <section class="view" id="view-models">
+      <header class="page-head">
+        <div class="eyebrow">Your models</div>
+        <h1>Models</h1>
+        <p class="lead">GGUF files in <code id="models-dir"></code>. Add one with:</p>
+      </header>
+      <pre class="cmd">langtrain pull bartowski/Qwen2.5-1.5B-Instruct-GGUF Qwen2.5-1.5B-Instruct-Q4_K_M.gguf</pre>
+      <div class="table-panel">
+        <table class="table">
+          <thead><tr><th>Model</th><th>Size</th><th>Adapters</th><th></th></tr></thead>
+          <tbody id="models-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Fine-tune -->
+    <section class="view" id="view-tune">
+      <header class="page-head">
+        <div class="eyebrow">Train on your data</div>
+        <h1>Fine-tune</h1>
+        <p class="lead">Train a LoRA adapter on this machine. It is ready to chat with as soon as the job finishes.</p>
+      </header>
+      <div class="grid2">
+        <form class="panel" id="tune-form">
+          <div class="eyebrow">New job</div>
+          <label>Base model <select id="tune-model" required></select></label>
+          <label>Training file (JSONL path) <input id="tune-file" required placeholder="/path/to/train.jsonl"></label>
+          <label>Adapter name <input id="tune-suffix" placeholder="support-bot" pattern="[A-Za-z0-9_\-]+"></label>
+          <div class="row">
+            <label>Epochs <input id="tune-epochs" type="number" min="1" value="3"></label>
+            <label>LoRA rank <input id="tune-rank" type="number" min="1" value="16"></label>
+          </div>
+          <div class="row">
+            <label>Train top layers <input id="tune-layers" type="number" min="1" placeholder="auto"></label>
+            <label>Device
+              <select id="tune-device"><option value="">auto</option><option>cpu</option><option>mps</option><option>cuda</option></select>
+            </label>
+          </div>
+          <p class="hint" id="tune-advice"></p>
+          <button type="submit" class="btn primary">Start training</button>
+          <p class="error" id="tune-error"></p>
+        </form>
+        <div class="panel">
+          <div class="eyebrow">Data format</div>
+          <p class="muted">One JSON object per line. Loss is computed on assistant replies only.</p>
+          <pre class="cmd">{"messages": [
+  {"role": "user", "content": "What is Langtrain?"},
+  {"role": "assistant", "content": "A local LLM studio."}
+]}</pre>
+          <p class="muted">Also accepted: <code>{"prompt", "completion"}</code> and <code>{"text"}</code>.</p>
+        </div>
+      </div>
+      <h2 class="section-title">Jobs</h2>
+      <div id="jobs"></div>
+    </section>
+
+    <!-- Billing (Langtrain Cloud) -->
+    <section class="view" id="view-billing">
+      <header class="page-head">
+        <div class="eyebrow">Langtrain Cloud</div>
+        <h1>Credits and usage</h1>
+        <p class="lead">Prepay for credits. Each request reserves its largest possible cost before it runs and is charged only for what it used.</p>
+      </header>
+
+      <div class="panel" id="bill-signin">
+        <h3>Sign in to Langtrain Cloud</h3>
+        <p class="muted">Create an account to get an API key, or paste a key you already have.</p>
+        <div class="grid2">
+          <form id="bill-signup" class="stack">
+            <label>Email <input id="bill-email" type="email" required autocomplete="email" placeholder="you@company.com"></label>
+            <div class="stack-tight">
+              <span class="label-text">Pay in</span>
+              <div class="segmented" data-toggle="bill-currency" role="radiogroup" aria-label="Currency">
+                <button type="button" role="radio" aria-checked="true" data-value="INR">₹ INR</button>
+                <button type="button" role="radio" aria-checked="false" data-value="USD">$ USD</button>
+              </div>
+              <input type="hidden" id="bill-currency" value="INR">
+            </div>
+            <button type="submit" class="btn primary">Create account</button>
+          </form>
+          <form id="bill-usekey" class="stack">
+            <label>API key <input id="bill-key" autocomplete="off" placeholder="lt_live_…"></label>
+            <button type="submit" class="btn ghost">Use this key</button>
+          </form>
+        </div>
+        <p class="error" id="bill-signin-error"></p>
+      </div>
+
+      <div class="panel accent" id="bill-newkey" hidden>
+        <div class="eyebrow">Your new API key</div>
+        <p class="success"><img src="/assets/check.svg" width="16" height="16" alt="">Copy it now: it is shown only once. Studio keeps it in this browser.</p>
+        <div class="keyrow"><code id="bill-newkey-value"></code><button type="button" class="btn ghost small" id="bill-copy">Copy</button></div>
+      </div>
+
+      <div id="bill-account" hidden>
+        <div class="balance-row">
+          <div class="panel raised">
+            <div class="eyebrow-label">Balance</div>
+            <div class="balance" id="bill-balance">–</div>
+            <p class="muted" id="bill-held"></p>
+            <p class="muted" id="bill-who"></p>
+            <button type="button" class="btn ghost small" id="bill-signout">Sign out of this browser</button>
+          </div>
+          <div class="table-panel">
+            <table class="table">
+              <thead><tr><th>Per million tokens</th><th>Price</th></tr></thead>
+              <tbody id="bill-prices"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <h2 class="section-title">Add credits</h2>
+        <div class="packs" id="bill-packs"></div>
+        <p class="hint" id="bill-pay-note"></p>
+        <p class="error" id="bill-pay-error"></p>
+
+        <h2 class="section-title">API keys</h2>
+        <form class="inline-form" id="bill-keyform">
+          <input id="bill-keyname" placeholder="Key name, for example laptop" maxlength="64">
+          <button type="submit" class="btn ghost small">Create key</button>
+        </form>
+        <div class="table-panel">
+          <table class="table"><thead><tr><th>Name</th><th>Key</th><th>Created</th><th>Last used</th><th></th></tr></thead><tbody id="bill-keys"></tbody></table>
+        </div>
+
+        <h2 class="section-title">Recent requests</h2>
+        <div class="table-panel">
+          <table class="table"><thead><tr><th>When</th><th>Model</th><th>Prompt</th><th>Output</th><th>Cost</th></tr></thead><tbody id="bill-usage"></tbody></table>
+        </div>
+
+        <h2 class="section-title">Credit history</h2>
+        <div class="table-panel">
+          <table class="table"><thead><tr><th>When</th><th>What</th><th>Amount</th></tr></thead><tbody id="bill-ledger"></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- System -->
+    <section class="view" id="view-system">
+      <header class="page-head">
+        <div class="eyebrow">This machine</div>
+        <h1>System</h1>
+        <p class="lead">What Studio detected, and the settings it chose for it.</p>
+      </header>
+      <div class="grid2">
+        <div class="panel"><div class="eyebrow">Hardware</div><dl id="hw"></dl></div>
+        <div class="panel"><div class="eyebrow">Auto-tuned profile</div><dl id="profile"></dl></div>
+      </div>
+      <div class="panel"><div class="eyebrow">Engine</div><dl id="engine"></dl></div>
+    </section>
+  </main>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
