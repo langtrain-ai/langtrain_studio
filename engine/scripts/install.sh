@@ -1,9 +1,9 @@
 #!/bin/sh
 # Install the latest Langtrain CLI on macOS or Linux:
-#   curl -fsSL https://raw.githubusercontent.com/langtrain/langtrain-studio/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/langtrain-ai/langtrain_studio/main/engine/scripts/install.sh | sh
 set -eu
 
-REPO="${LANGTRAIN_REPO:-langtrain/langtrain-studio}"
+REPO="${LANGTRAIN_REPO:-langtrain-ai/langtrain_studio}"
 DEST="${LANGTRAIN_INSTALL_DIR:-$HOME/.langtrain}"
 
 os=$(uname -s)

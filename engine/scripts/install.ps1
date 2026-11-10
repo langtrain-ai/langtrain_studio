@@ -1,7 +1,7 @@
 # Install the latest Langtrain CLI on Windows:
-#   irm https://raw.githubusercontent.com/langtrain/langtrain-studio/main/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/langtrain-ai/langtrain_studio/main/engine/scripts/install.ps1 | iex
 $ErrorActionPreference = "Stop"
-$Repo = if ($env:LANGTRAIN_REPO) { $env:LANGTRAIN_REPO } else { "langtrain/langtrain-studio" }
+$Repo = if ($env:LANGTRAIN_REPO) { $env:LANGTRAIN_REPO } else { "langtrain-ai/langtrain_studio" }
 $Dest = if ($env:LANGTRAIN_INSTALL_DIR) { $env:LANGTRAIN_INSTALL_DIR } else { Join-Path $env:USERPROFILE ".langtrain" }
 
 $arch = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "aarch64" } else { "x86_64" }

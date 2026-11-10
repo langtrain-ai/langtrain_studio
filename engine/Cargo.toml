@@ -6,7 +6,7 @@ members = ["crates/engine", "crates/native", "crates/web", "crates/server", "cra
 version = "1.0.8"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/langtrain/langtrain-studio"
+repository = "https://github.com/langtrain-ai/langtrain_studio"
 
 [workspace.dependencies]
 anyhow = "1"
