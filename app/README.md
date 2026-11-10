@@ -61,8 +61,8 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/langtrain-ai/langtrain_studio_desktop.git
-cd langtrain_studio_desktop
+git clone https://github.com/langtrain-ai/langtrain_studio.git
+cd langtrain_studio/app
 
 # Install dependencies
 pnpm install

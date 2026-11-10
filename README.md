@@ -1,5 +1,7 @@
 # Langtrain Studio
 
+`github.com/langtrain-ai/langtrain_studio`, cloned as `langtrain_studio/`.
+
 One desktop app for **macOS, Windows and Linux**, with the Langtrain engine
 built in. Every change here ships to all three platforms from the same code.
 
@@ -69,5 +71,9 @@ This repo combines two earlier ones, with their full history:
 - `engine/` was **langtrain-studio**. Its separate desktop shell
   (`engine/studio/`) was removed: `app/` is now the one desktop app.
 
-The native SwiftUI macOS app (**langtrain_studio**) is archived, not merged:
-it is proprietary and stays in its own private repository.
+This repository is the old **langtrain_studio_desktop** repo, renamed; GitHub
+redirects its old URLs, including release downloads.
+
+The native SwiftUI macOS app, which used to be **langtrain_studio**, is now the
+archived private repo **langtrain_studio_macos**. It is proprietary and was
+not merged.
