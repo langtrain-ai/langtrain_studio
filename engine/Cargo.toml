@@ -1,10 +1,9 @@
 [workspace]
 resolver = "2"
-exclude = ["studio/src-tauri"]
 members = ["crates/engine", "crates/native", "crates/web", "crates/server", "crates/cli"]
 
 [workspace.package]
-version = "0.1.0"
+version = "1.0.8"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/langtrain/langtrain-studio"

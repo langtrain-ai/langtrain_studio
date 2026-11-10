@@ -112,7 +112,7 @@ async function streamCompletion(
     signal,
   });
 
-  if (!res.ok) throw new Error(`llama-server ${res.status}: ${await res.text()}`);
+  if (!res.ok) throw new Error(`Langtrain engine ${res.status}: ${await res.text()}`);
 
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();

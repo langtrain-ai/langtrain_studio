@@ -69,8 +69,8 @@ In cloud mode, fine-tuning jobs and `/v1/admin/*` need the admin token, and `/v1
 | `crates/web` | `langtrain-web`: the Studio UI, embedded with `include_str!`; no Node build step. |
 | `crates/cli` | `langtrain serve / run / list / pull / doctor / bench / tune`. |
 | `langtune/` | Python trainer: LoRA on the top K layers, frozen-prefix activation cache, GGUF adapter export. |
-| `studio/` | Tauri 2 desktop shell that runs `langtrain serve` as a sidecar. |
-| `.github/workflows` | CI on Linux x64/arm64, macOS and Windows; tagged releases for 6 targets plus desktop bundles. |
+| `../app/` | The Langtrain Studio desktop app (macOS, Windows, Linux), which bundles this engine as a sidecar. |
+| `../.github/workflows` | CI on Linux x64/arm64, macOS and Windows; tagged releases for 6 targets plus the desktop app. |
 
 `--backend auto` (the default) uses the native engine when it supports the model file and llama.cpp otherwise. Force one with `--backend native` or `--backend llama`.
 

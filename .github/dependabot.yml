@@ -19,7 +19,7 @@ updates:
       - '*'
   open-pull-requests-limit: 2
 - package-ecosystem: npm
-  directory: /
+  directory: /app
   schedule:
     interval: monthly
   groups:
@@ -37,7 +37,9 @@ updates:
     update-types:
     - version-update:semver-major
 - package-ecosystem: cargo
-  directory: /src-tauri
+  directories:
+  - /app/src-tauri
+  - /engine
   schedule:
     interval: monthly
   groups:

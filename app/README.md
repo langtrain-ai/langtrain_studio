@@ -70,7 +70,8 @@ pnpm install
 # Run the frontend Vite dev server (browser preview)
 pnpm dev
 
-# Run inside the native Tauri desktop shell
+# Build the bundled engine once (from the repo root), then run the app
+# ../scripts/build-engine.sh
 pnpm tauri dev
 
 # Build production desktop binaries

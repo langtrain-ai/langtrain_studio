@@ -47,7 +47,10 @@ export interface DownloadProgress {
 
 export interface ServerStatus {
     running: boolean;
+    /** Path of the model file that was started. */
     model: string | null;
+    /** The engine's name for that model; sent as `model` in chat requests. */
+    model_name: string | null;
     port: number;
     endpoint: string | null;
 }
@@ -101,41 +104,56 @@ export const ModelManagerService = {
 };
 
 // ==================== Inference Service ====================
+// Local models run on the Langtrain engine bundled with the app (engine/ in
+// the Langtrain_Studio repo). It can serve several models, so every request
+// names one: the model last started here unless the caller passes another.
+
+let activeModel: string | null = null;
+
+function remember(status: ServerStatus): ServerStatus {
+    activeModel = status.running ? status.model_name : null;
+    return status;
+}
 
 export const InferenceService = {
     async start(
         modelPath: string,
         options?: { port?: number; contextSize?: number; gpuLayers?: number }
     ): Promise<ServerStatus> {
-        return invoke<ServerStatus>('start_inference_server', {
+        return remember(await invoke<ServerStatus>('start_inference_server', {
             modelPath,
             port: options?.port,
             contextSize: options?.contextSize,
             gpuLayers: options?.gpuLayers,
-        });
+        }));
     },
 
     async stop(): Promise<ServerStatus> {
-        return invoke<ServerStatus>('stop_inference_server');
+        return remember(await invoke<ServerStatus>('stop_inference_server'));
     },
 
     async status(): Promise<ServerStatus> {
-        return invoke<ServerStatus>('inference_server_status');
+        return remember(await invoke<ServerStatus>('inference_server_status'));
     },
 
     /**
      * Send a chat completion to the local inference server.
-     * Uses the OpenAI-compatible endpoint exposed by llama.cpp.
+     * Uses the engine's OpenAI-compatible endpoint.
      */
     async chat(
         messages: Array<{ role: string; content: string }>,
-        options?: { temperature?: number; maxTokens?: number; port?: number }
+        options?: { temperature?: number; maxTokens?: number; port?: number; model?: string }
     ): Promise<{ content: string; model: string; tokens: number }> {
         const port = options?.port ?? 11435;
+        const model = options?.model ?? activeModel;
+        if (!model) {
+            throw new Error('No local model is running. Start one from Local Models first.');
+        }
         const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
+                model,
                 messages,
                 temperature: options?.temperature ?? 0.7,
                 max_tokens: options?.maxTokens ?? 2048,

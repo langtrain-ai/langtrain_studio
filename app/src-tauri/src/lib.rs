@@ -43,6 +43,14 @@ pub fn run() {
             langtrain_cloud::download_cloud_model,
             langtrain_cloud::check_cloud_connection,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // Quitting the app stops the engine it started (not one the user
+            // runs separately).
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                app.state::<InferenceState>().shutdown();
+            }
+        });
 }

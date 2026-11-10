@@ -1,0 +1,176 @@
+name: Release
+
+# One tag releases everything: the desktop app for macOS, Windows and Linux
+# (with the engine bundled inside), and the standalone engine CLI.
+#
+#   node scripts/version.mjs set 1.1.0 && git commit -am "Release 1.1.0"
+#   git tag v1.1.0 && git push origin main v1.1.0
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Fails if the tag and VERSION (or any file) disagree.
+      - run: node scripts/version.mjs check
+
+  app:
+    name: App (${{ matrix.name }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS Apple silicon, os: macos-15,       target: aarch64-apple-darwin,     platform: macos,   arch: arm64 }
+          - { name: macOS Intel,         os: macos-15-intel, target: x86_64-apple-darwin,      platform: macos,   arch: x64 }
+          - { name: Windows,             os: windows-2022,   target: x86_64-pc-windows-msvc,   platform: windows, arch: x64 }
+          - { name: Linux,               os: ubuntu-22.04,   target: x86_64-unknown-linux-gnu, platform: linux,   arch: x64 }
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_API_KEY: ${{ secrets.RELEASE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with: { version: 10 }
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: |
+            engine
+            app/src-tauri
+      - name: Linux deps for Tauri
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Build the engine sidecar
+        shell: bash
+        run: scripts/build-engine.sh --target ${{ matrix.target }}
+
+      - name: Install frontend dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and upload the app
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS signing and notarisation. Unset, the app is still built but
+          # macOS warns on first open (right-click > Open).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: app
+          args: --target ${{ matrix.target }}
+          tagName: ${{ github.ref_name }}
+          releaseName: Langtrain Studio ${{ github.ref_name }}
+          releaseBody: |
+            One app for every platform, with the Langtrain engine built in.
+
+            - **macOS**: `.dmg` (`aarch64` for Apple silicon, `x64` for Intel)
+            - **Windows**: `.exe` or `.msi` installer
+            - **Linux**: `.AppImage` or `.deb`
+
+            The `langtrain-*` archives are the standalone engine CLI.
+          releaseDraft: false
+          prerelease: false
+
+      # Tells api.langtrain.xyz about the new downloads (the site's download page).
+      - name: Register downloads
+        if: env.RELEASE_API_KEY != ''
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          base="https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}"
+          case "${{ matrix.platform }}" in
+            macos)
+              if [ "${{ matrix.arch }}" = arm64 ]; then files="dmg:Langtrain.Studio_${v}_aarch64.dmg"; else files="dmg:Langtrain.Studio_${v}_x64.dmg"; fi ;;
+            windows) files="x64:Langtrain.Studio_${v}_x64-setup.exe" ;;
+            linux)   files="appimage:Langtrain.Studio_${v}_amd64.AppImage deb:Langtrain.Studio_${v}_amd64.deb" ;;
+          esac
+          for f in $files; do
+            kind="${f%%:*}"; name="${f#*:}"
+            arch="${{ matrix.arch }}"; [ "${{ matrix.platform }}" = linux ] && arch="$kind"
+            curl -fsS -X POST "https://api.langtrain.xyz/v1/releases/ci" \
+              -H "X-Release-API-Key: $RELEASE_API_KEY" -H "Content-Type: application/json" \
+              -d "{\"version\":\"$v\",\"platform\":\"${{ matrix.platform }}\",\"architecture\":\"$arch\",\"download_url\":\"$base/$name\",\"status\":\"active\",\"changelog\":\"See https://github.com/${{ github.repository }}/releases/tag/${GITHUB_REF_NAME}\"}" \
+              || echo "::warning::Could not register $name with api.langtrain.xyz"
+          done
+
+  engine:
+    name: Engine CLI (${{ matrix.target }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-15,         target: aarch64-apple-darwin,      features: "llama,metal" }
+          - { os: macos-15-intel,   target: x86_64-apple-darwin,       features: "llama" }
+          - { os: ubuntu-22.04,     target: x86_64-unknown-linux-gnu,  features: "llama" }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, features: "llama" }
+          - { os: windows-2022,     target: x86_64-pc-windows-msvc,    features: "llama" }
+          - { os: windows-11-arm,   target: aarch64-pc-windows-msvc,   features: "llama" }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: engine
+      # Portable binaries: no -C target-cpu=native. The native engine picks
+      # SIMD kernels at runtime; llama.cpp is built with GGML_NATIVE=OFF.
+      - name: Build
+        run: cargo build --release -p langtrain --no-default-features --features "${{ matrix.features }}" --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          name=langtrain-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir -p dist/$name
+          bin=target/${{ matrix.target }}/release/langtrain
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          cp "$bin" dist/$name/
+          cp -r langtune dist/$name/langtune
+          cp README.md dist/$name/
+          cd dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a -tzip $name.zip $name >/dev/null
+            sha256sum $name.zip > $name.zip.sha256
+          else
+            tar czf $name.tar.gz $name
+            shasum -a 256 $name.tar.gz > $name.tar.gz.sha256
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            engine/dist/*.tar.gz
+            engine/dist/*.zip
+            engine/dist/*.sha256

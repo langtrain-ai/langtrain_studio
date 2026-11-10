@@ -1,6 +1,6 @@
 [package]
 name = "langtrain-studio-desktop"
-version = "0.1.0"
+version = "1.0.8"
 description = "Langtrain Studio — Local AI model inference, fine-tuning, and agent execution"
 authors = ["Langtrain"]
 edition = "2021"

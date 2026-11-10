@@ -1,0 +1,5 @@
+# Engine sidecar, built by scripts/build-engine.sh
+app/src-tauri/binaries/
+.DS_Store
+.claude/
+**/.cc-writes

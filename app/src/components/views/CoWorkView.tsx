@@ -2,7 +2,7 @@
  * CoWorkView — Split-pane workspace with local AI assistant
  * 
  * Layout: File Tree | Code Editor | Chat Panel
- * Connects to either local inference (llama.cpp) or remote API
+ * Connects to either local inference (the bundled Langtrain engine) or remote API
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';

@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # One version for the app on every platform and the engine inside it.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: node scripts/version.mjs check
+
+  # The desktop app (app/): the same code ships to macOS, Windows and Linux.
+  app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with: { version: 10 }
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck and build frontend
+        run: pnpm build
+      - name: Linux deps for Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      # tauri-build requires the sidecar file to exist; the engine itself is
+      # built and tested in the engine job.
+      - name: Placeholder engine sidecar
+        run: |
+          mkdir -p src-tauri/binaries
+          touch "src-tauri/binaries/langtrain-$(rustc -vV | sed -n 's/^host: //p')"
+      - name: Cargo check and test
+        working-directory: app/src-tauri
+        run: |
+          cargo check --locked
+          cargo test --locked
+
+  # The engine (engine/): native kernels differ per CPU, so test on each.
+  engine:
+    name: Engine (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-22.04-arm, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine
+      # Engine, native kernels (NEON on arm64, AVX2 on x64), server and UI; no llama.cpp build.
+      - run: cargo test --workspace --no-default-features --release
+      # Make sure the llama.cpp backend still compiles everywhere.
+      - run: cargo build -p langtrain --release
+
+  langtune:
+    name: LangTune (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install transformers gguf numpy pytest
+      - run: python -m pytest -q langtune/tests
