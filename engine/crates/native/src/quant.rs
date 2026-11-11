@@ -898,13 +898,14 @@ fn avx2() -> bool {
 #[target_feature(enable = "avx2")]
 unsafe fn dot32_avx2(a: *const i8, b: *const i8) -> i32 {
     use std::arch::x86_64::*;
-    let va = _mm256_loadu_si256(a as *const __m256i);
-    let vb = _mm256_loadu_si256(b as *const __m256i);
-    // maddubs needs one unsigned operand: |a| * (b * sign(a)).
-    let ax = _mm256_sign_epi8(va, va);
-    let sy = _mm256_sign_epi8(vb, va);
-    let p16 = _mm256_maddubs_epi16(ax, sy);
-    let p32 = _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
+    // Widen to i16 and use madd (i16*i16 pairs summed into i32): exact for
+    // every input. The usual sign_epi8 + maddubs trick is wrong for -128,
+    // which can't be negated in 8 bits (-128 * -128 came out as -16384).
+    let a_lo = _mm256_cvtepi8_epi16(_mm_loadu_si128(a as *const __m128i));
+    let a_hi = _mm256_cvtepi8_epi16(_mm_loadu_si128(a.add(16) as *const __m128i));
+    let b_lo = _mm256_cvtepi8_epi16(_mm_loadu_si128(b as *const __m128i));
+    let b_hi = _mm256_cvtepi8_epi16(_mm_loadu_si128(b.add(16) as *const __m128i));
+    let p32 = _mm256_add_epi32(_mm256_madd_epi16(a_lo, b_lo), _mm256_madd_epi16(a_hi, b_hi));
     let s = _mm_add_epi32(
         _mm256_castsi256_si128(p32),
         _mm256_extracti128_si256(p32, 1),
@@ -965,8 +966,16 @@ mod tests {
             );
             assert_eq!(dot16(&a[..16], &b[..16]), dot32_scalar(&a[..16], &b[..16]));
         }
-        let max = vec![-128i8; 32];
-        assert_eq!(dot32(&max, &max), dot32_scalar(&max, &max));
+        // Edge values: -128 can't be negated in 8 bits, which broke the old
+        // AVX2 sign trick. Random inputs above never produce it.
+        let edges = [i8::MIN, -127, -1, 0, 1, i8::MAX];
+        for &x in &edges {
+            for &y in &edges {
+                let (a, b) = (vec![x; 32], vec![y; 32]);
+                assert_eq!(dot32(&a, &b), dot32_scalar(&a, &b), "dot32 of {x} and {y}");
+                assert_eq!(dot16(&a[..16], &b[..16]), dot32_scalar(&a[..16], &b[..16]), "dot16 of {x} and {y}");
+            }
+        }
     }
 
     #[test]
