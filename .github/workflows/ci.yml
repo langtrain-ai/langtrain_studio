@@ -89,14 +89,19 @@ jobs:
       matrix:
         os: [ubuntu-22.04, macos-15, windows-2022]
     runs-on: ${{ matrix.os }}
+    # Run from the project folder: from engine/, Python would resolve
+    # `langtune` to the project directory (a namespace package) instead of
+    # the langtune/langtune package, and test collection fails.
     defaults:
       run:
-        working-directory: engine
+        working-directory: engine/langtune
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: pip install transformers gguf numpy pytest
-      - run: python -m pytest -q langtune/tests
+      # Installs the package and its declared dependencies, so CI also checks
+      # that pyproject.toml is complete.
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest -q tests
