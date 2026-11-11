@@ -1,121 +1,79 @@
-# Langtrain Studio Desktop
+# Langtrain Studio
 
-<div align="center">
-  <img src="public/langtrain-app-logo.svg" alt="Langtrain Logo" width="128" height="128">
-  
-  **The unified desktop studio for [Langtrain](https://langtrain.xyz) — Autonomous Agents, LLM Fine-Tuning, and Serving**
-  
-  [![Tauri](https://img.shields.io/badge/Tauri-2.0-blue?logo=tauri)](https://tauri.app)
-  [![React](https://img.shields.io/badge/React-19-blue?logo=react)](https://react.dev)
-  [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-blue?logo=typescript)](https://typescriptlang.org)
-  [![Vite](https://img.shields.io/badge/Vite-7-646CFF?logo=vite)](https://vitejs.dev)
-  [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-</div>
+`github.com/langtrain-ai/langtrain_studio`, cloned as `langtrain_studio/`.
 
----
+One desktop app for **macOS, Windows and Linux**, with the Langtrain engine
+built in. Every change here ships to all three platforms from the same code.
 
-## Overview
+```
+Langtrain_Studio/
+├── VERSION        one version for everything (see "Releasing")
+├── app/           the desktop app: Tauri 2 + React. Same code on every OS
+├── engine/        the Langtrain engine (Rust): OpenAI/Ollama-compatible
+│                  server, native inference, CPU fine-tuning (LangTune)
+├── scripts/
+│   ├── version.mjs       set / check the version everywhere
+│   └── build-engine.sh   build the engine into the app as its sidecar
+└── .github/workflows/
+    ├── ci.yml       every PR: version check, app, engine on 4 OSes, LangTune
+    └── release.yml  a v* tag: app installers for all platforms + engine CLI
+```
 
-**Langtrain Studio** is a cross-platform desktop application designed for AI engineers building, aligning, fine-tuning, and serving LLMs and autonomous agents. Built with Tauri 2.0 and React 19, it gives you native desktop speed (~50MB RAM footprint) and complete control over local and cloud workflows.
+## How the pieces fit
 
-- 🤖 **Autonomous Agents** — Create, configure, monitor, and interact with agent workflows
-- 📁 **Datasets & Curation** — Ingest raw data, auto-detect schemas, and convert to training-ready JSONL
-- 🎯 **Fine-Tuning Jobs** — Configure and monitor QLoRA, LoRA, DPO, and full training runs locally or on cloud GPUs
-- 🚀 **vLLM Serving** — Spin up optimized inference engines with real-time token streaming
-- 📊 **Analytics & Telemetry** — Monitor token throughput, cost estimation, and job completion metrics
-- 💾 **Local & Offline Models** — Connect to local Ollama / LM Studio or local weight checkouts
-- ⚙️ **Configurable Endpoints** — Switch seamlessly between Cloud (`api.langtrain.xyz`) and local dev servers (`localhost:8000`)
+The app bundles the engine as a sidecar (`langtrain serve` on
+`127.0.0.1:11435`). Local models in the app run on it. Both use
+`~/.langtrain/models`, so a model downloaded in the app is immediately
+available to the engine, and to `langtrain` on the command line.
 
----
-
-## Views & Capabilities
-
-| View | Description |
-|---|---|
-| **Overview** | System summary, active agents, running fine-tuning jobs, and GPU utilization |
-| **Agents** | Multi-agent runtime configuration, tool permissions, and interactive execution |
-| **Projects** | Workspace organization for datasets, models, and run configurations |
-| **Datasets** | Dataset upload, validation, row inspection, and Hugging Face import |
-| **Data Curation** | Pattern detection, column mapping, and automated JSONL conversion |
-| **Model Registry** | Curated catalog of open weights (Llama 3.1/3.2, Mistral, Qwen, DeepSeek) |
-| **vLLM Serve** | Local and remote model serving with OpenAI-compatible API endpoints |
-| **Tuning Jobs** | Real-time training loss graphs, evaluation metrics, and checkpoint exports |
-| **Analytics** | Token consumption, historical spend, and job latency telemetry |
-| **Local Models** | On-device model discovery via Ollama/LM Studio and local runners |
-| **Settings** | Live authentication tokens, customizable backend endpoints, and theme management |
-
----
-
-## Quick Start
-
-### Prerequisites
-- [Node.js](https://nodejs.org/) 20+
-- [pnpm](https://pnpm.io/) 10+
-- [Rust](https://rustup.rs/) 1.75+ (for Tauri builds)
-- Platform-specific build tools:
-  - **macOS**: Xcode Command Line Tools (`xcode-select --install`)
-  - **Linux**: `libwebkit2gtk-4.1-dev`, `libssl-dev`, `libgtk-3-dev`, `build-essential`
-  - **Windows**: Visual Studio 2022 C++ Build Tools
-
-### Running the App
+## Develop
 
 ```bash
-# Clone the repository
-git clone https://github.com/langtrain-ai/langtrain_studio_desktop.git
-cd langtrain_studio_desktop
-
-# Install dependencies
-pnpm install
-
-# Run the frontend Vite dev server (browser preview)
-pnpm dev
-
-# Run inside the native Tauri desktop shell
-pnpm tauri dev
-
-# Build production desktop binaries
-pnpm tauri build
+scripts/build-engine.sh            # once, and after engine changes (adds app/src-tauri/binaries/)
+cd app && pnpm install
+pnpm tauri dev                     # the app, with live reload
 ```
 
----
+`scripts/build-engine.sh --fast` skips llama.cpp for a quicker build; the
+native engine still runs most models.
 
-## Configuration & Environments
+Engine on its own: see `engine/README.md` (`cargo run -p langtrain -- serve`).
 
-Langtrain Studio supports both cloud infrastructure and self-hosted environments:
+## Releasing
 
-1. **Cloud Production** (default):
-   - **Backend API**: `https://api.langtrain.xyz` (auto-routes through `/api/v1`)
-   - **Web / Auth**: `https://app.langtrain.xyz` and `https://auth.langtrain.xyz`
-2. **Local Self-Hosted**:
-   - Navigate to **Settings → API Settings** in the app.
-   - Click **Local Server (:8000)** or enter `http://localhost:8000`.
-   - The app immediately updates its target to `http://localhost:8000/api/v1`.
-
----
-
-## Architecture
-
-```
-langtrain_studio_desktop/
-├── src/
-│   ├── components/
-│   │   ├── layout/            # Sidebar, Topbar, Window Frame
-│   │   ├── views/             # AgentsView, DatasetsView, TrainingView, SettingsView, etc.
-│   │   └── common/            # Reusable buttons, cards, modals, tables
-│   ├── services/
-│   │   ├── api.ts             # Unified API client matching langtrain-server /api/v1
-│   │   ├── auth.ts            # TOTP & session authentication manager
-│   │   └── local.ts           # Ollama / LM Studio discovery and local inference
-│   ├── lib/
-│   │   ├── settings.ts        # SettingsManager with reactive endpoint switching
-│   │   ├── storage.ts         # Secure local storage wrapper
-│   │   └── tokens/            # Design tokens (colors, typography, navigation)
-│   └── main.tsx               # App bootstrapper
-└── src-tauri/                 # Rust Tauri shell configuration & native window handlers
+```bash
+node scripts/version.mjs set 1.1.0     # updates the app, Tauri, Cargo and lockfiles
+git commit -am "Release 1.1.0"
+git tag v1.1.0 && git push origin main v1.1.0
 ```
 
----
+The tag builds and publishes, in one GitHub release:
 
-## License
+| Platform | Files |
+|---|---|
+| macOS (Apple silicon, Intel) | `.dmg` |
+| Windows | `.exe`, `.msi` |
+| Linux | `.AppImage`, `.deb` |
+| Engine CLI | `langtrain-v1.1.0-<target>.tar.gz` / `.zip` for 6 targets |
 
-MIT © [Langtrain AI](https://langtrain.xyz)
+CI refuses a tag that does not match `VERSION`.
+
+macOS builds are signed and notarised when the `APPLE_*` secrets are set;
+without them they are still built, and macOS asks for right-click > Open on
+first launch. `RELEASE_API_KEY` registers the downloads with api.langtrain.xyz.
+
+## History
+
+This repo combines two earlier ones, with their full history:
+
+- `app/` was **langtrain_studio_desktop** (Windows and Linux only; macOS was
+  switched off in favour of the Swift app).
+- `engine/` was **langtrain-studio**. Its separate desktop shell
+  (`engine/studio/`) was removed: `app/` is now the one desktop app.
+
+This repository is the old **langtrain_studio_desktop** repo, renamed; GitHub
+redirects its old URLs, including release downloads.
+
+The native SwiftUI macOS app, which used to be **langtrain_studio**, is now the
+archived private repo **langtrain_studio_macos**. It is proprietary and was
+not merged.

@@ -1,41 +1,5 @@
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-
-node_modules
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
+# Engine sidecar, built by scripts/build-engine.sh
+app/src-tauri/binaries/
 .DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-
-# Rust build artifacts (equivalent to DerivedData in Xcode)
-src-tauri/target/
-
-# Generated Tauri schemas
-src-tauri/gen/
-
-# macOS metadata
-.DS_Store
-
-# Tauri bundle outputs
-src-tauri/bundle/
-*.app
-*.dmg
-*.msi
-*.deb
-*.rpm
+.claude/
+**/.cc-writes

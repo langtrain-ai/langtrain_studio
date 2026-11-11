@@ -1,0 +1,25 @@
+[package]
+name = "langtrain-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Real inference through llama.cpp. GPU backends are opt-in on top of it.
+llama = ["dep:llama-cpp-2"]
+metal = ["llama", "llama-cpp-2/metal"]
+cuda = ["llama", "llama-cpp-2/cuda"]
+vulkan = ["llama", "llama-cpp-2/vulkan"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+sysinfo = "0.40"
+llama-cpp-2 = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

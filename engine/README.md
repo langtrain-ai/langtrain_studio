@@ -1,0 +1,119 @@
+# Langtrain Studio
+
+Fast local LLM serving and fine-tuning that works on a plain CPU. One binary for macOS, Linux and Windows, with:
+
+- an **OpenAI-compatible API** (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/v1/fine_tuning/jobs`)
+- an **Ollama-compatible API** (`/api/chat`, `/api/generate`, `/api/tags`), so existing Ollama clients work unchanged
+- the **Studio web UI** at `http://127.0.0.1:11435/` (Chat, Models, Fine-tune, System), compiled into the binary
+- a **native Rust inference engine**, with llama.cpp as a fallback for models it doesn't cover yet
+- **LangTune**, LoRA fine-tuning designed for CPUs. Trained adapters are served immediately as `model@adapter`, with no merge step.
+
+## Quick start
+
+```bash
+cargo build --release -p langtrain
+./target/release/langtrain pull bartowski/SmolLM2-135M-Instruct-GGUF SmolLM2-135M-Instruct-Q8_0.gguf
+./target/release/langtrain run SmolLM2-135M-Instruct-Q8_0 "What is the capital of France?"
+./target/release/langtrain serve            # API + Studio UI on :11435 (use --port 11434 to stand in for Ollama)
+```
+
+Fine-tune (needs Python with `torch`, `transformers` and `gguf`):
+
+```bash
+pip install -e langtune
+langtrain tune SmolLM2-135M-Instruct-Q8_0 train.jsonl --name support-bot   # talks to a running `langtrain serve`
+langtrain run SmolLM2-135M-Instruct-Q8_0@support-bot
+```
+
+`train.jsonl` holds one example per line, as `{"messages": [...]}`, `{"prompt", "completion"}` or `{"text"}`.
+
+## Langtrain Cloud: sell your GPU, paid in advance
+
+`langtrain serve --cloud` turns the server into a paid API on your hardware. Every request needs an API key, and every request is paid for before it runs:
+
+1. Customers sign up in Studio (or `POST /v1/signup`) and get an API key, shown once and stored only as a hash.
+2. They buy a credit pack: Razorpay (UPI, cards) for rupees, Stripe for dollars. Credits are added only by a signed webhook for a checkout this server created, and each payment is applied once.
+3. Each request reserves its worst-case cost (prompt size plus `max_tokens`) from the balance, or is refused with `402 Payment Required`.
+4. When it ends, even if the client disconnects, the hold is released and the actual tokens are charged. Cached prompt tokens cost less.
+
+Setup:
+
+```bash
+export RAZORPAY_KEY_ID=... RAZORPAY_KEY_SECRET=... RAZORPAY_WEBHOOK_SECRET=...   # rupee payments
+export STRIPE_SECRET_KEY=... STRIPE_WEBHOOK_SECRET=...                           # dollar payments
+export LANGTRAIN_ADMIN_TOKEN=...                                                 # operator API
+langtrain serve --cloud --host 0.0.0.0
+```
+
+Point the providers' webhooks at `https://<your-domain>/v1/billing/webhooks/razorpay` (event `order.paid`) and `/v1/billing/webhooks/stripe` (event `checkout.session.completed`). Prices, packs, trial credit, token limits and the per-account concurrency limit live in `~/.langtrain/cloud.json`, written with defaults on first run; set `public_url` to your domain. Balances and history are in `~/.langtrain/billing.db` (SQLite), as an append-only ledger.
+
+Operator commands:
+
+```bash
+langtrain billing accounts
+langtrain billing create --email a@b.com --currency INR    # prints an API key
+langtrain billing new-key --email a@b.com                  # replace a lost key
+langtrain billing grant --email a@b.com --amount 500 --note "refund"
+```
+
+In cloud mode, fine-tuning jobs and `/v1/admin/*` need the admin token, and `/v1/system` hides hardware details. Run it behind HTTPS (a reverse proxy such as Caddy or nginx). Not yet included: email verification, GST invoices, auto-recharge and customer fine-tuning jobs (Phase 2 and 3 in the business plan).
+
+## Layout
+
+| Path | What it is |
+|---|---|
+| `crates/engine` | Scheduler: continuous batching, chunked prefill, slot prefix cache with cross-slot KV copy, per-step multi-LoRA groups, sampling, stop strings. Backend-agnostic, with a mock backend for tests. |
+| `crates/native` | Langtrain's own engine: zero-copy GGUF reader, int8 kernels (NEON, AVX2, portable) for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0 and the K-quants Q4_K/Q5_K/Q6_K, paged f16 KV cache with copy-on-write, byte-level BPE tokenizer, Jinja chat templates, Llama/Mistral/Qwen2 forward pass, unmerged LoRA. |
+| `crates/engine/src/llama.rs` | llama.cpp backend (all GGUF quant types and architectures; Metal/CUDA/Vulkan builds; reloads on the CPU if the GPU cannot be used). |
+| `crates/server` | axum daemon: OpenAI + Ollama APIs, model store, fine-tuning job runner, and Langtrain Cloud billing (keys, prepaid ledger, metering, Razorpay/Stripe). |
+| `crates/web` | `langtrain-web`: the Studio UI, embedded with `include_str!`; no Node build step. |
+| `crates/cli` | `langtrain serve / run / list / pull / doctor / bench / tune`. |
+| `langtune/` | Python trainer: LoRA on the top K layers, frozen-prefix activation cache, GGUF adapter export. |
+| `../app/` | The Langtrain Studio desktop app (macOS, Windows, Linux), which bundles this engine as a sidecar. |
+| `../.github/workflows` | CI on Linux x64/arm64, macOS and Windows; tagged releases for 6 targets plus the desktop app. |
+
+`--backend auto` (the default) uses the native engine when it supports the model file and llama.cpp otherwise. Force one with `--backend native` or `--backend llama`.
+
+Concurrency and context are tuned to the machine's RAM; override them with `--parallel <slots>` and `--ctx <tokens per slot>` (or `LANGTRAIN_PARALLEL` / `LANGTRAIN_CTX`).
+
+## How CPU fine-tuning stays fast
+
+1. **Frozen, quantized base.** Only the LoRA weights train; the base model never needs gradients or optimizer state.
+2. **Top-K layers only.** LoRA is applied to the last K of L layers (on CPU the default is about a third of the layers).
+3. **Frozen-prefix activation cache.** The hidden states entering layer L-K never change during training, so they are computed once (fp16) and reused. Every step runs forward and backward through K layers instead of L.
+4. **Sparse LM head.** Logits are computed only at labeled (assistant) positions, which matters with 100k+ vocabularies.
+5. **Built to run in the background.** The trainer runs at low OS priority, checkpoints and resumes, and reports progress and an ETA as JSON lines.
+
+## Measured so far
+
+Apple M2 (4 performance + 4 efficiency cores, 16 GB), CPU only, SmolLM2-135M-Instruct, 4 threads (the auto-tuned default). Throughput from `langtrain bench` (about 300 tokens of shared system prompt, 64 new tokens per request):
+
+| | Native engine | llama.cpp |
+|---|---|---|
+| Greedy output vs llama.cpp, Q8_0 | Identical over 120 tokens (code, quotes, emoji) | reference |
+| Greedy output vs llama.cpp, Q4_K_M | Coherent; diverges after a few tokens (activation block size differs at near-tied logits) | reference |
+| Dequantization vs gguf-py reference, Q4_K_M | All 211 tensors match (Q4_K, Q6_K, Q5_0, Q8_0) | |
+| Q4_K_M, 1 stream | ~249 tok/s | ~319 tok/s |
+| Q4_K_M, 4 and 8 concurrent streams | ~370–415 tok/s total | ~375–410 tok/s total |
+| Q8_0, 1 stream | ~267 tok/s | ~305 tok/s |
+| Q8_0, 4 concurrent streams | ~470 tok/s total | ~675 tok/s total |
+| Prefix cache on a shared system prompt | 93–97% of prompt tokens reused | same scheduler |
+
+Single-stream and batched results from the native engine are bit-identical for a given request: one kernel serves both paths, so an answer never depends on how many other requests are running.
+
+LangTune: 30 examples, 8 epochs, top 10/30 layers took 43 s end to end on the CPU (loss 2.29 → 0.004), and the adapter answered correctly on both engines.
+
+What got the native engine here:
+
+- **A spin-then-park thread pool** for the per-token hot path. A small model's token runs about 200 short matmuls, and waking parked threads for each cost as much as the work.
+- **One kernel per weight format and token count** (NEON `sdot`), unrolled so accumulators stay in registers. A 4096x4096 Q8_0 matmul reaches about 110 GB/s, the M2's memory bandwidth; batches unpack each weight block once for up to 4 tokens.
+- **Grouped attention**: each cached K/V row is widened from f16 once and shared by the query heads that use it.
+- **Performance cores only** on hybrid CPUs; adding the efficiency cores made both engines slower.
+
+## Native engine roadmap
+
+- Close the remaining gap on Q8_0 batches and single streams: i8mm `smmla` tiles for batches, fused attention, int8 KV cache
+- AVX-512/AMX and SVE kernels
+- SentencePiece tokenizers (Llama 2, Mistral v0.1) and more architectures (Gemma, Phi, Qwen3)
+- Speculative decoding, constrained JSON output, KV cache saved to disk
+- A Metal compute path
